@@ -19,3 +19,15 @@ def test_classify_road_sidewalk_by_polygon():
     labels = classify_road_sidewalk(ground, road_lines, width_m=3.0)
     assert labels[0] == "road"
     assert labels[1] == "sidewalk"
+
+
+from pipeline.segment import cluster_objects, keep_car_clusters
+
+
+def test_keep_car_clusters_filters_by_size(synthetic_points):
+    ground, car = synthetic_points
+    tiny = np.array([[15, 15, 0.2], [15.1, 15.1, 0.25]])
+    cars = keep_car_clusters([car, tiny])
+    assert len(cars) == 1
+    assert 2.0 <= cars[0]["length"] <= 6.0
+    assert 1.4 <= cars[0]["width"] <= 2.2
