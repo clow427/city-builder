@@ -3,13 +3,17 @@ import requests
 from config import APS_HOST
 
 
-def start_translation(token, urn):
+def start_translation(token, urn, root_filename=None):
+    inp = {"urn": urn}
+    if root_filename:                      # zip input (e.g. OBJ + MTL)
+        inp["compressedUrn"] = True
+        inp["rootFilename"] = root_filename
     r = requests.post(
         f"{APS_HOST}/modelderivative/v2/designdata/job",
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json",
                  "x-ads-force": "true"},
-        json={"input": {"urn": urn},
+        json={"input": inp,
               "output": {"formats": [{"type": "svf2", "views": ["2d", "3d"]}]}},
         timeout=30,
     )

@@ -23,12 +23,15 @@ def lift_assets(points, assets_geojson, src_epsg, dst_crs, bbox_proj, radius=0.8
     tree = cKDTree(points[:, :2])
     out = []
     for _, row in gdf.iterrows():
-        cx, cy = row.geometry.x, row.geometry.y
+        if row.geometry is None:
+            continue
+        c = row.geometry.centroid       # robust to Point/LineString/Polygon assets
+        cx, cy = c.x, c.y
         near = tree.query_ball_point([cx, cy], radius)
         if not near:
             continue
         gz, tz, h = z_extent(points[near, 2])
-        out.append({"type": row.get("Type") or row.get("asset_type") or "asset",
+        out.append({"type": row.get("asset_type") or row.get("Type") or "asset",
                     "x": float(cx), "y": float(cy),
                     "ground_z": gz, "top_z": tz, "height": h})
     return out
