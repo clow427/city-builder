@@ -1,14 +1,47 @@
 """Turn classified ground points into a solid triangulated heightfield mesh.
 
 Grid the ROI into square cells, take mean ground z per cell, fill empty cells
-from the nearest filled cell, then emit one quad per cell grouped into two OBJ
-objects by surface material (road -> asphalt, everything else -> concrete).
+from the nearest filled cell, then emit one quad per cell grouped into OBJ
+objects by surface material (road -> asphalt, sidewalk -> concrete, grass).
+
+When `road_bins` is supplied (a per-cell pavement-condition bin from
+pipeline.pavement, flattened ix*ny+iy like the rest of the grid), road cells are
+split into `ground_road_good/fair/poor` objects with the green->red condition
+materials, so each bin is a selectable, recolorable dbId in the viewer. Road
+cells with no condition match fall back to a plain `ground_road` (asphalt).
 """
 import numpy as np
 from scipy.spatial import cKDTree
 
+ROAD_BIN_MATERIALS = [
+    ("good", "road_good", "ground_road_good"),
+    ("fair", "road_fair", "ground_road_fair"),
+    ("poor", "road_poor", "ground_road_poor"),
+]
 
-def ground_grid_mesh(ground_pts, labels, bbox, cell=0.5):
+
+def _quad_object(name, material, mask, xmin, ymin, cell, vz):
+    """Build one OBJ object from a boolean (nx, ny) cell mask, or None if empty."""
+    nx, ny = mask.shape
+    verts, vmap, faces = [], {}, []
+
+    def vid(i, j):
+        key = (i, j)
+        if key not in vmap:
+            vmap[key] = len(verts)
+            verts.append((xmin + i * cell, ymin + j * cell, vz[i, j]))
+        return vmap[key]
+
+    for i in range(nx):
+        for j in range(ny):
+            if mask[i, j]:
+                faces.append((vid(i, j), vid(i + 1, j), vid(i + 1, j + 1), vid(i, j + 1)))
+    if not faces:
+        return None
+    return {"name": name, "material": material, "verts": verts, "faces": faces}
+
+
+def ground_grid_mesh(ground_pts, labels, bbox, cell=0.5, road_bins=None):
     xmin, ymin, xmax, ymax = bbox
     nx = max(int(np.ceil((xmax - xmin) / cell)), 1)
     ny = max(int(np.ceil((ymax - ymin) / cell)), 1)
@@ -57,23 +90,28 @@ def ground_grid_mesh(ground_pts, labels, bbox, cell=0.5):
 
     objs = []
     matgrid = matcell.reshape(nx, ny)
-    for ci_, (mat, name) in enumerate([("asphalt", "ground_road"),
-                                       ("concrete", "ground_sidewalk"),
-                                       ("grass", "ground_grass")]):
-        mask = matgrid == ci_
-        verts, vmap, faces = [], {}, []
+    road_mask = matgrid == 0
 
-        def vid(i, j):
-            key = (i, j)
-            if key not in vmap:
-                vmap[key] = len(verts)
-                verts.append((xmin + i * cell, ymin + j * cell, vz[i, j]))
-            return vmap[key]
+    if road_bins is not None:
+        binsgrid = np.asarray(road_bins, dtype=object).reshape(nx, ny)
+        for bin_name, mat, obj_name in ROAD_BIN_MATERIALS:
+            o = _quad_object(obj_name, mat, road_mask & (binsgrid == bin_name),
+                             xmin, ymin, cell, vz)
+            if o:
+                objs.append(o)
+        known = np.isin(binsgrid, [b for b, _, _ in ROAD_BIN_MATERIALS])
+        unbinned = _quad_object("ground_road", "asphalt", road_mask & ~known,
+                                xmin, ymin, cell, vz)
+        if unbinned:
+            objs.append(unbinned)
+    else:
+        o = _quad_object("ground_road", "asphalt", road_mask, xmin, ymin, cell, vz)
+        if o:
+            objs.append(o)
 
-        for i in range(nx):
-            for j in range(ny):
-                if mask[i, j]:
-                    faces.append((vid(i, j), vid(i + 1, j), vid(i + 1, j + 1), vid(i, j + 1)))
-        if faces:
-            objs.append({"name": name, "material": mat, "verts": verts, "faces": faces})
+    for ci_, mat, name in [(1, "concrete", "ground_sidewalk"),
+                           (2, "grass", "ground_grass")]:
+        o = _quad_object(name, mat, matgrid == ci_, xmin, ymin, cell, vz)
+        if o:
+            objs.append(o)
     return objs

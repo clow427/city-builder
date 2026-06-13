@@ -107,3 +107,30 @@ function deleteCar() {
   if (selected == null) return alert("Select a car first");
   viewer.hide(selected);
 }
+
+// Phase 1 cost panel: render the static repair estimate written by run.py
+// (out/estimate.json, served at /api/estimate).
+let costLoaded = false;
+function toggleCost() {
+  const panel = document.getElementById("cost");
+  const show = panel.style.display === "none";
+  panel.style.display = show ? "block" : "none";
+  if (show && !costLoaded) { costLoaded = true; loadEstimate(); }
+}
+
+function loadEstimate() {
+  fetch("/api/estimate").then(r => r.json()).then(rep => {
+    const body = document.getElementById("cost-body");
+    if (rep.error) { body.textContent = rep.error; return; }
+    const usd = n => "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    let html = "<table style='border-collapse:collapse;width:100%'>";
+    for (const li of rep.line_items) {
+      html += `<tr><td style='padding:1px 6px 1px 0'>${li.description}</td>`
+            + `<td style='text-align:right;padding:1px 0'>${usd(li.amount)}</td></tr>`;
+    }
+    html += `<tr><td style='padding-top:6px;font-weight:700;color:#DEFF00'>Total</td>`
+          + `<td style='padding-top:6px;text-align:right;font-weight:700;color:#DEFF00'>${usd(rep.total)}</td></tr>`;
+    html += "</table>";
+    body.innerHTML = html;
+  }).catch(err => { document.getElementById("cost-body").textContent = "estimate unavailable"; console.error(err); });
+}

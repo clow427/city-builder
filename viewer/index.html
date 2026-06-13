@@ -8,6 +8,15 @@
   <button onclick="moveCar()">Move selected car</button>
   <button onclick="deleteCar()">Delete selected car</button>
   <button onclick="togglePoints()">Toggle point cloud</button>
+  <button onclick="toggleCost()">Cost estimate</button>
+</div>
+<div id="cost" style="position:absolute;z-index:9;bottom:8px;left:8px;display:none;
+  background:#111;color:#eee;padding:10px 12px;font:12px/1.45 sans-serif;
+  max-width:340px;max-height:50vh;overflow:auto;border:1px solid #DEFF00">
+  <div style="font-weight:700;color:#DEFF00;margin-bottom:6px">Repair estimate</div>
+  <div id="cost-body">loading…</div>
+  <a id="cost-dl" href="/api/estimate" download="estimate.json"
+     style="color:#DEFF00;display:inline-block;margin-top:8px">Download JSON</a>
 </div>
 <div id="v"></div>
 <script>const URN="dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y3l2bC1oYWNrLXhhdmllci9zY2VuZV9jYWRfdjYuemlw";</script>

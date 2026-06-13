@@ -1,0 +1,37 @@
+# config/unit_costs.yaml — StreetForge unit-cost catalog.
+#
+# ILLUSTRATIVE DEFAULTS ONLY. These are placeholder figures so the cost engine
+# has something to multiply against; they are NOT bid-grade. Replace with local,
+# current numbers (municipal bid tabs / DOT unit-cost books) before any real use.
+#
+# Units:
+#   *_sqft       -> dollars per square foot
+#   *_linear_ft  -> dollars per linear foot
+#   *_each       -> dollars per item
+#   relocation.* -> dollars per relocated asset (by asset_type)
+
+# Pavement treatments (priced by area). Keys match treatment names used in
+# scenario "repave" edits via pipeline/cost.py TREATMENT_KEYS.
+pavement:
+  crack_seal_sqft:        0.50
+  mill_and_overlay_sqft:  4.50
+  full_depth_recon_sqft: 12.00
+
+# Linear / area items used by geometry, sidewalk and re-grade edits.
+curb_linear_ft:          35.00
+sidewalk_sqft:           12.00
+curb_ramp_each:        2500.00
+regrade_sqft:             8.00
+
+# Asset relocation, per-each, keyed by asset_type (case-insensitive). Unknown
+# types fall back to `default`.
+relocation:
+  utility_pole:         8000.00
+  traffic_signal:      15000.00
+  traffic_signal_pole: 15000.00
+  hydrant:              4500.00
+  sign:                  600.00
+  luminaries:           3500.00
+  manhole_cover:        2000.00
+  catch_basin:          2500.00
+  default:              1500.00

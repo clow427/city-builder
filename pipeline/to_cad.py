@@ -8,6 +8,10 @@ import math
 
 MATERIALS = {
     "asphalt":  (0.13, 0.13, 0.15),
+    # pavement-condition ramp (green -> amber -> red) for binned road cells
+    "road_good": (0.20, 0.60, 0.24),
+    "road_fair": (0.85, 0.65, 0.13),
+    "road_poor": (0.70, 0.16, 0.14),
     "concrete": (0.80, 0.78, 0.72),
     "grass":    (0.36, 0.50, 0.28),
     "car":      (0.30, 0.38, 0.50),

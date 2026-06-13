@@ -145,11 +145,58 @@ ground_shift[:, 1] -= oy
 for o in bld_objs:
     o["verts"] = [(x - ox, y - oy, z) for x, y, z in o["verts"]]
 
-ground_objs = ground_grid_mesh(ground_shift, labels, (0, 0, ROI_M, ROI_M), cell=0.5)
+# pavement condition: bin road cells by nearest Cyvl pavement segment score so
+# the ground mesh emits selectable ground_road_good/fair/poor objects. Best
+# effort — if the Cyvl layer can't be loaded, fall back to a single asphalt road.
+CELL = 0.5
+from pipeline import cyvl_source, pavement as pv
+spec = pv.grid_spec((0, 0, ROI_M, ROI_M), CELL, origin=(ox, oy))
+gx, gy = pv.cell_centers(spec)
+road_bins = None
+try:
+    pav = cyvl_source.load_layer("pavements", crs, source="auto",
+                                 local_dir="data", bbox_proj=bbox_proj)
+    cond = pv.assign_condition(gx, gy, pav)
+    road_bins = cond["bin"]
+    binned = sum(1 for b in road_bins if b)
+    print(f"pavement condition: {binned} cells matched a segment "
+          f"(good {list(road_bins).count('good')}, fair {list(road_bins).count('fair')}, "
+          f"poor {list(road_bins).count('poor')})")
+    try:
+        dist = cyvl_source.load_layer("distresses", crs, source="auto",
+                                      local_dir="data", bbox_proj=bbox_proj)
+        cen = dist.geometry.centroid
+        dc = pv.count_in_cells(cen.x.values, cen.y.values, spec)
+        print(f"distresses in ROI: {int(dc.sum())}")
+    except Exception as e:
+        print(f"distress density skipped: {e}")
+except Exception as e:
+    print(f"pavement condition skipped ({e}); roads render as plain asphalt")
+
+ground_objs = ground_grid_mesh(ground_shift, labels, (0, 0, ROI_M, ROI_M),
+                               cell=CELL, road_bins=road_bins)
 objs = ground_objs + bld_objs + car_objects(cars) + asset_objects(assets)
 write_mtl("out/scene.mtl")
 write_obj("out/scene.obj", objs, mtl_filename="scene.mtl")
 print(f"scene.obj objects: {len(objs)} (ground {len(ground_objs)} + cars {len(cars)} + assets {len(assets)})")
+
+# static whole-block estimate: price bringing fair/poor road up to standard.
+# Area per bin comes straight from the emitted road object's cell (face) count.
+from pipeline.cost import estimate, load_catalog, cells_to_sqft
+TREATMENT_FOR_BIN = {"poor": "full_depth_recon", "fair": "mill_and_overlay"}
+edits = [{"op": "repave", "target": o["name"],
+          "treatment": TREATMENT_FOR_BIN[o["name"].rsplit("_", 1)[1]],
+          "area_sqft": cells_to_sqft(len(o["faces"]), CELL)}
+         for o in ground_objs
+         if o["name"].rsplit("_", 1)[1] in TREATMENT_FOR_BIN
+         and o["name"].startswith("ground_road_")]
+if edits:
+    report = estimate(edits, load_catalog())
+    os.makedirs("out", exist_ok=True)
+    report.write("out/estimate.md")
+    report.write("out/estimate.json")
+    print(f"baseline repair estimate: ${report.total:,.2f} "
+          f"({len(edits)} road sections) -> out/estimate.md")
 
 # zip OBJ + MTL (Model Derivative needs a zip for multi-file inputs)
 import zipfile
