@@ -4,6 +4,9 @@
 <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
 <style>#v{position:absolute;inset:0}</style>
 </head><body>
+<div style="position:absolute;z-index:9;top:8px;left:50%;transform:translateX(-50%)">
+  <select id="scene-select" onchange="onSceneChange(this.value)" style="font:700 12px sans-serif;padding:3px 6px"></select>
+</div>
 <div style="position:absolute;z-index:9;top:8px;left:8px">
   <button onclick="startRelocate()">Relocate selected</button>
   <button onclick="undoEdit()">Undo</button>
@@ -17,10 +20,9 @@
   max-width:340px;max-height:50vh;overflow:auto;border:1px solid #DEFF00">
   <div style="font-weight:700;color:#DEFF00;margin-bottom:6px">Proposal estimate</div>
   <div id="cost-body">loading…</div>
-  <a id="cost-dl" href="/api/scenario" download="proposal.json"
+  <a id="cost-dl" href="#" download="proposal.json" onclick="this.href='/api/scenario?scene='+encodeURIComponent(currentScene.id)"
      style="color:#DEFF00;display:inline-block;margin-top:8px">Download proposal</a>
 </div>
 <div id="v"></div>
-<script>const URN="dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2NhZF92Ny56aXA";</script>
 <script src="viewer.js"></script>
 </body></html>

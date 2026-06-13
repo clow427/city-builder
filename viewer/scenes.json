@@ -1,0 +1,20 @@
+[
+  {
+    "id": "davis_sq_a",
+    "label": "Davis Square A",
+    "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2NhZF92Ny56aXA",
+    "data_dir": "out/davis_sq_a"
+  },
+  {
+    "id": "dummy",
+    "label": "Dummy test scene (2 cars)",
+    "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2ItZHVtbXkteWp6MzFnZ2FkbGdqL3NjZW5lX2R1bW15Lm9iag",
+    "data_dir": null
+  },
+  {
+    "id": "elm_st",
+    "label": "Elm St / Dover St",
+    "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2VsbV9zdC56aXA",
+    "data_dir": "out/elm_st"
+  }
+]

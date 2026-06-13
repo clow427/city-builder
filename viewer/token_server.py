@@ -19,6 +19,7 @@ import os
 import re
 import socketserver
 import sys
+from urllib.parse import urlparse, parse_qs
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -28,6 +29,7 @@ from pipeline.cost import estimate, load_catalog  # noqa: E402
 from pipeline.scenario import Scenario  # noqa: E402
 
 OUT_DIR = os.path.join(REPO, "out")
+SCENES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenes.json")
 _TRAILING_INDEX = re.compile(r"_\d+$")
 _CATALOG = None
 
@@ -37,6 +39,26 @@ def catalog():
     if _CATALOG is None:
         _CATALOG = load_catalog()
     return _CATALOG
+
+
+def scenes() -> list:
+    if os.path.exists(SCENES_FILE):
+        with open(SCENES_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def out_dir_for_scene(scene_id) -> str:
+    """Data directory (scene_meta/assets/scenario/estimate) for a scene id.
+
+    Scenes with no `data_dir` (e.g. the dummy test scene) get a directory that
+    doesn't exist, so reads fall back to empty defaults.
+    """
+    for s in scenes():
+        if s.get("id") == scene_id:
+            data_dir = s.get("data_dir")
+            return os.path.join(REPO, data_dir) if data_dir else os.path.join(REPO, "out", "_none")
+    return OUT_DIR
 
 
 # --------------------------------------------------------------- request logic
@@ -125,28 +147,47 @@ class H(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/token":
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        out_dir = out_dir_for_scene(qs.get("scene", [None])[0])
+        if parsed.path == "/api/token":
             return self._json({"access_token": get_token("data:read"), "expires_in": 3600})
-        if self.path == "/api/scene_meta":
-            return self._json(scene_meta())
-        if self.path == "/api/assets":
-            return self._json(asset_registry())
-        if self.path == "/api/scenario":
-            return self._json(scenario_state())
-        if self.path == "/api/estimate":
-            data = _read_json(os.path.join(OUT_DIR, "estimate.json"))
+        if parsed.path == "/api/scenes":
+            return self._json(scenes())
+        if parsed.path == "/api/points.bin":
+            path = os.path.join(out_dir, "points.bin")
+            if not os.path.exists(path):
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            self.end_headers()
+            with open(path, "rb") as f:
+                self.wfile.write(f.read())
+            return
+        if parsed.path == "/api/scene_meta":
+            return self._json(scene_meta(out_dir))
+        if parsed.path == "/api/assets":
+            return self._json(asset_registry(out_dir))
+        if parsed.path == "/api/scenario":
+            return self._json(scenario_state(out_dir))
+        if parsed.path == "/api/estimate":
+            data = _read_json(os.path.join(out_dir, "estimate.json"))
             return self._json(data if data is not None else
                               {"currency": "USD", "total": 0, "by_op": {},
                                "line_items": [], "error": "no estimate yet"})
         return super().do_GET()
 
     def do_POST(self):
-        if self.path != "/api/scenario":
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/scenario":
             return self._json({"error": "not found"}, 404)
+        qs = parse_qs(parsed.query)
+        out_dir = out_dir_for_scene(qs.get("scene", [None])[0])
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
-            return self._json(apply_post(body))
+            return self._json(apply_post(body, out_dir))
         except Exception as e:  # noqa: BLE001 — surface the message to the client
             return self._json({"error": str(e)}, 400)
 
@@ -154,6 +195,7 @@ class H(http.server.SimpleHTTPRequestHandler):
 def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("open http://localhost:8080/index.html")
+    socketserver.TCPServer.allow_reuse_address = True
     socketserver.TCPServer(("", 8080), H).serve_forever()
 
 

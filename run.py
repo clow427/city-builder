@@ -37,24 +37,46 @@ def voxel_downsample(p, v):
     return p[np.sort(idx)]
 
 
-LAS = glob.glob(config.LAZ_DIR + "/*.laz")[0]
-crs = las_crs(LAS)
+# Resolve ROI center first (env overrides tile default) so we can pick the
+# tile whose bounding box actually contains the requested point.
+_all_laz = sorted(glob.glob(config.LAZ_DIR + "/*.laz"))
+if not _all_laz:
+    raise FileNotFoundError(f"no .laz files in {config.LAZ_DIR!r}")
 
-with laspy.open(LAS) as f:
-    h = f.header
-    cx = (h.mins[0] + h.maxs[0]) / 2
-    cy = (h.mins[1] + h.maxs[1]) / 2
-# optional ROI center override (UTM) to focus on an asset-dense spot
+# Use the first tile to resolve a default center, then re-pick once we know cx/cy.
+with laspy.open(_all_laz[0]) as _f:
+    _h = _all_laz[0] and _f.header
+    cx = (_h.mins[0] + _h.maxs[0]) / 2
+    cy = (_h.mins[1] + _h.maxs[1]) / 2
 cx = float(os.environ.get("ROI_CX", cx))
 cy = float(os.environ.get("ROI_CY", cy))
+
+# Pick the tile whose bounding box contains cx/cy; fall back to nearest centroid.
+def _pick_tile(files, x, y):
+    for f in files:
+        with laspy.open(f) as lf:
+            h = lf.header
+            if h.mins[0] <= x <= h.maxs[0] and h.mins[1] <= y <= h.maxs[1]:
+                return f
+    def _dist(f):
+        with laspy.open(f) as lf:
+            h = lf.header
+            return ((h.mins[0]+h.maxs[0])/2 - x)**2 + ((h.mins[1]+h.maxs[1])/2 - y)**2
+    return min(files, key=_dist)
+
+LAS = _pick_tile(_all_laz, cx, cy)
+print(f"Using tile: {os.path.basename(LAS)}")
+crs = las_crs(LAS)
+block_id = os.environ.get("BLOCK_ID") or os.path.splitext(os.path.basename(LAS))[0]
+OUT_DIR = os.path.join("out", block_id)
+os.makedirs(OUT_DIR, exist_ok=True)
 bbox_proj = (cx - ROI_M / 2, cy - ROI_M / 2, cx + ROI_M / 2, cy + ROI_M / 2)
 print("ROI bbox_proj:", bbox_proj)
 
 # PDAL pass 1: crop to ROI in streaming mode (readers.las + filters.crop are
 # both streamable, so the full tile is never loaded into memory at once) and
 # write the small cropped result to a temp file.
-cropped = "out/_cropped.las"
-os.makedirs("out", exist_ok=True)
+cropped = os.path.join(OUT_DIR, "_cropped.las")
 crop_pl = pdal.Pipeline(json.dumps({"pipeline": [
     {"type": "readers.las", "filename": LAS},
     {"type": "filters.crop",
@@ -93,8 +115,8 @@ gt = cKDTree(ground_ds[:, :2])
 _, gi = gt.query(ng_ds[:, :2], k=1)
 h_above = ng_ds[:, 2] - ground_ds[gi, 2]
 band = ng_ds[(h_above > H_LO) & (h_above < H_HI)]
-lbl = DBSCAN(eps=0.5, min_samples=12).fit_predict(band[:, :2])
 cars, car_pts = [], []
+lbl = DBSCAN(eps=0.5, min_samples=12).fit_predict(band[:, :2]) if len(band) else []
 for k in set(lbl):
     if k == -1:
         continue
@@ -141,7 +163,7 @@ if car_pts:
     cp = np.vstack(car_pts)
     all_pts = np.vstack([ground_ds, cp])
     all_cls = list(labels) + ["car"] * len(cp)
-write_colored_las("out/classified.laz", all_pts, all_cls)
+write_colored_las(os.path.join(OUT_DIR, "classified.laz"), all_pts, all_cls)
 
 # CAD scene for APS Viewer — shift to local origin so coords are ~0..ROI_M
 ox, oy = bbox_proj[0], bbox_proj[1]
@@ -187,8 +209,8 @@ except Exception as e:
 ground_objs = ground_grid_mesh(ground_shift, labels, (0, 0, ROI_M, ROI_M),
                                cell=CELL, road_bins=road_bins)
 objs = ground_objs + bld_objs + car_objects(cars) + asset_objects(assets)
-write_mtl("out/scene.mtl")
-write_obj("out/scene.obj", objs, mtl_filename="scene.mtl")
+write_mtl(os.path.join(OUT_DIR, "scene.mtl"))
+write_obj(os.path.join(OUT_DIR, "scene.obj"), objs, mtl_filename="scene.mtl")
 print(f"scene.obj objects: {len(objs)} (ground {len(ground_objs)} + cars {len(cars)} + assets {len(assets)})")
 
 # static whole-block estimate: price bringing fair/poor road up to standard.
@@ -201,11 +223,10 @@ edits = [{"op": "repave", "target": o["name"],
          for o in ground_objs
          if o["name"].rsplit("_", 1)[1] in TREATMENT_FOR_BIN
          and o["name"].startswith("ground_road_")]
-os.makedirs("out", exist_ok=True)
 if edits:
     report = estimate(edits, load_catalog())
-    report.write("out/estimate.md")
-    report.write("out/estimate.json")
+    report.write(os.path.join(OUT_DIR, "estimate.md"))
+    report.write(os.path.join(OUT_DIR, "estimate.json"))
     print(f"baseline repair estimate: ${report.total:,.2f} "
           f"({len(edits)} road sections) -> out/estimate.md")
 
@@ -213,27 +234,37 @@ if edits:
 # authored position, and clearance-check relocations against buildings/curbs.
 from pipeline.scene_export import asset_registry, scene_meta, obstacles
 crs_str = f"EPSG:{crs.to_epsg()}" if crs.to_epsg() else crs.to_string()
-block_id = os.environ.get("BLOCK_ID") or os.path.splitext(os.path.basename(LAS))[0]
 json.dump(scene_meta(block_id, crs_str, (ox, oy), ROI_M, CELL, bbox_proj),
-          open("out/scene_meta.json", "w"))
-json.dump(asset_registry(objs, (ox, oy)), open("out/assets.json", "w"))
+          open(os.path.join(OUT_DIR, "scene_meta.json"), "w"))
+json.dump(asset_registry(objs, (ox, oy)), open(os.path.join(OUT_DIR, "assets.json"), "w"))
 json.dump(obstacles([b["poly"] for b in builds], road_zone, bbox_proj, crs_str),
-          open("out/obstacles.json", "w"))
+          open(os.path.join(OUT_DIR, "obstacles.json"), "w"))
 print(f"wrote scene_meta/assets ({len(asset_registry(objs, (ox, oy)))} draggable)"
-      f"/obstacles to out/")
+      f"/obstacles to {OUT_DIR}/")
 
 # zip OBJ + MTL (Model Derivative needs a zip for multi-file inputs)
 import zipfile
-with zipfile.ZipFile("out/scene_cad.zip", "w", zipfile.ZIP_DEFLATED) as z:
-    z.write("out/scene.obj", "scene.obj")
-    z.write("out/scene.mtl", "scene.mtl")
+zip_path = os.path.join(OUT_DIR, "scene_cad.zip")
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(os.path.join(OUT_DIR, "scene.obj"), "scene.obj")
+    z.write(os.path.join(OUT_DIR, "scene.mtl"), "scene.mtl")
 
 # APS: upload under a fresh key (avoids stale SVF2 cache) -> translate -> URN
 tok = get_token()
 bucket = os.environ.get("APS_BUCKET", f"cb-{config.APS_CLIENT_ID[:12].lower()}")
 ensure_bucket(tok, bucket)
-object_key = os.environ.get("SCENE_KEY", "scene_cad_v1.zip")
-urn = upload_object(tok, bucket, object_key, "out/scene_cad.zip")
+object_key = os.environ.get("SCENE_KEY", f"scene_{block_id}.zip")
+urn = upload_object(tok, bucket, object_key, zip_path)
 start_translation(tok, urn, root_filename="scene.obj")
 wait_until_done(tok, urn)
-print("\nPASTE THIS URN INTO viewer/index.html:\n", urn)
+print(f"\nScene '{block_id}' URN: {urn}")
+
+# Auto-register in viewer/scenes.json so the dropdown picks it up immediately.
+scenes_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer", "scenes.json")
+scenes = json.load(open(scenes_path)) if os.path.exists(scenes_path) else []
+label = os.environ.get("SCENE_LABEL", block_id.replace("_", " ").title())
+entry = {"id": block_id, "label": label, "urn": urn, "data_dir": OUT_DIR}
+scenes = [s for s in scenes if s.get("id") != block_id]  # replace if already exists
+scenes.append(entry)
+json.dump(scenes, open(scenes_path, "w"), indent=2)
+print(f"Registered '{block_id}' in viewer/scenes.json ({len(scenes)} scenes total)")

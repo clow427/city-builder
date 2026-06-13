@@ -21,6 +21,11 @@ ROI_M = float(os.environ.get("ROI_M", 80.0))
 VOXEL = 0.15
 MAX_POINTS = 2_500_000
 
+block_id = os.environ.get("BLOCK_ID") or os.path.splitext(
+    os.path.basename(glob.glob(config.LAZ_DIR + "/*.laz")[0]))[0]
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", block_id)
+os.makedirs(OUT_DIR, exist_ok=True)
+
 LAS = glob.glob(config.LAZ_DIR + "/*.laz")[0]
 with laspy.open(LAS) as f:
     h = f.header
@@ -72,7 +77,7 @@ xyz[:, 0] -= bbox[0]
 xyz[:, 1] -= bbox[1]
 pos = xyz.astype(np.float32)
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer", "points.bin")
+out = os.path.join(OUT_DIR, "points.bin")
 with open(out, "wb") as f:
     f.write(struct.pack("<I", len(pos)))
     f.write(pos.tobytes())
