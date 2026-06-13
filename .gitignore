@@ -25,3 +25,4 @@ out/
 *.glb
 *.gltf
 points.bin
+Miniforge3-Linux-x86_64.sh
