@@ -16,5 +16,17 @@
     "label": "Elm St / Dover St",
     "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2VsbV9zdC56aXA",
     "data_dir": "out/elm_st"
+  },
+  {
+    "id": "highland_ave",
+    "label": "Highland Ave",
+    "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2hpZ2hsYW5kX2F2ZS56aXA",
+    "data_dir": "out/highland_ave"
+  },
+  {
+    "id": "college_ave",
+    "label": "College Ave / Cameron",
+    "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6Y2IteWp6MzFnZ2FkbGdqL3NjZW5lX2NvbGxlZ2VfYXZlLnppcA",
+    "data_dir": "out/college_ave"
   }
 ]

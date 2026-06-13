@@ -111,11 +111,12 @@ print(f"ground_ds: {len(ground_ds)}  road: {labels.count('road')}  "
       f"sidewalk: {labels.count('sidewalk')}  grass: {labels.count('grass')}")
 
 # CARS: height band above local ground -> cluster footprint -> car-shaped boxes
-gt = cKDTree(ground_ds[:, :2])
-_, gi = gt.query(ng_ds[:, :2], k=1)
-h_above = ng_ds[:, 2] - ground_ds[gi, 2]
-band = ng_ds[(h_above > H_LO) & (h_above < H_HI)]
-cars, car_pts = [], []
+cars, car_pts, band = [], [], np.zeros((0, 3))
+if len(ng_ds):
+    gt = cKDTree(ground_ds[:, :2])
+    _, gi = gt.query(ng_ds[:, :2], k=1)
+    h_above = ng_ds[:, 2] - ground_ds[gi, 2]
+    band = ng_ds[(h_above > H_LO) & (h_above < H_HI)]
 lbl = DBSCAN(eps=0.5, min_samples=12).fit_predict(band[:, :2]) if len(band) else []
 for k in set(lbl):
     if k == -1:

@@ -46,6 +46,7 @@ function loadScene(s) {
   currentScene = s;
   selected = null;
   nameDb = {}; assetByName = {}; placed = {}; history = []; sceneMeta = null;
+  assetFrags = null;
   endRelocate();
 
   if (lidarPoints) {
@@ -77,6 +78,13 @@ function loadScene(s) {
       b.textContent = "objects loaded: " + leaves.length + " [" + leaves.join(", ") + "]";
       document.body.appendChild(b);
       console.log("leaf objects:", leaves);
+    });
+    // Build per-asset fragment clusters once all geometry has streamed in (so
+    // fragment world-bounds are final) and the asset registry is loaded. If the
+    // registry isn't ready yet, the first grab builds them lazily instead.
+    viewer.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, function onGeom() {
+      viewer.removeEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, onGeom);
+      if (Object.keys(assetByName).length) buildAssetFrags();
     });
     // useConsolidation:false — consolidation merges small meshes into shared
     // GPU batches, which makes per-object fragment transforms drag neighbors.
@@ -172,94 +180,119 @@ function setStatus(msg, ms) {
   if (ms) setTimeout(() => { el.style.display = "none"; }, ms);
 }
 
-// --- relocation: drag a movable asset across the ground ----------------------
-// Movable assets = cars, trees, push-buttons — everything in the /api/assets
-// registry. Ground, roads and buildings are deliberately not movable (no
-// relocate op prices them). Two ways to move one: (1) press-drag-release on it,
-// or (2) select it and hit "Relocate selected", then click a ground destination.
+// --- relocation: drag a single movable asset across the ground --------------
+// Movable assets = cars, trees, push-buttons — everything in /api/assets.
+// Ground, roads and buildings are deliberately not movable (no relocate op
+// prices them).
+//
+// The deployed SVF2 model groups geometry by MATERIAL, not by object: all cars
+// live under one "car" node, every tree canopy under "canopy", etc. So there is
+// no per-car dbId to grab — moving a dbId would move every car at once. Instead
+// we work at the FRAGMENT level: each car/tree is a co-located cluster of
+// fragments, so we move only the fragments within a small radius of the grabbed
+// asset's authored position (radius < the ~6 m spacing between assets). Clusters
+// are computed once at load, from authored positions, so they stay stable as
+// assets are moved around. This also works on object-separated models.
 
-let relocatePick = null;   // {name, dbIds} armed by the button flow
+let relocatePick = null;   // {name, fragIds, reg} armed by the button flow
 let dragTool = null;
+let assetFrags = null;     // name -> [fragId], built once per scene (see below)
 
-// Cosmetic sub-parts share an asset's prefix (car_01_cabin, tree_03_canopy);
-// map them back to the registered anchor name.
-const SUBPART_RE = /_(cabin|canopy|roof|base|body|trunk|leaves|leaf|wheels|post|pole|head|sign|panel|top|bottom)$/i;
+const CLUSTER_R = 3.0;     // metres; half the inter-asset spacing
+// Names of non-movable geometry — matches both material-grouped ("asphalt",
+// "wall") and object-separated ("ground_road", "building_01") models.
+const NONMOVABLE_RE = /(ground|road|sidewalk|building|wall|roof|asphalt|concrete|grass|pavement|curb|terrain)/i;
 
-function assetBaseFor(name) {
-  if (!name) return null;
-  if (assetByName[name]) return name;
-  const s = name.replace(SUBPART_RE, "");
-  return (s !== name && assetByName[s]) ? s : null;
-}
-
-// Current viewer-world XY of an asset's anchor: authored UTM minus scene origin
-// minus the viewer's global offset, plus any move already applied.
-function assetWorldXY(name) {
-  const reg = assetByName[name];
-  if (!reg || !sceneMeta) return null;
-  const o = sceneMeta.origin || [0, 0];
+// Viewer-world XY of an asset, using a given UTM (authored or current).
+function utmToWorldXY(utm) {
+  const o = (sceneMeta && sceneMeta.origin) || [0, 0];
   const off = (viewer.model.getData().globalOffset) || { x: 0, y: 0 };
-  const cur = placed[name] || reg.utm;
-  return { x: cur[0] - o[0] - off.x, y: cur[1] - o[1] - off.y };
+  return { x: utm[0] - o[0] - off.x, y: utm[1] - o[1] - off.y };
 }
 
 function nearestAsset(pt, maxDist) {
   let best = null, bestD = maxDist;
   for (const name in assetByName) {
-    const w = assetWorldXY(name);
-    if (!w) continue;
+    const reg = assetByName[name];
+    const w = utmToWorldXY(placed[name] || reg.utm);
     const d = Math.hypot(w.x - pt.x, w.y - pt.y);
     if (d <= bestD) { bestD = d; best = name; }
   }
   return best;
 }
 
-// All dbIds that form an asset: the anchor plus same-prefix sub-parts, so the
-// whole car (body + cabin) moves as one rigid piece.
-function dbIdsForAsset(base) {
+function movableDbIds() {
   const ids = [];
-  for (const nm in nameDb) {
-    if (nm === base || nm.startsWith(base + "_")) ids.push(nameDb[nm]);
-  }
+  for (const nm in nameDb) if (!NONMOVABLE_RE.test(nm)) ids.push(nameDb[nm]);
   return ids;
 }
 
-// Resolve a clicked/hovered dbId to {name, dbIds}, or null if it's not movable.
-// Tries the node name and its ancestors first, then falls back to proximity
-// against authored asset positions — so drag still works on SVF2 trees whose
-// node names don't line up with the registry.
-function pickAsset(dbId, worldPt) {
-  const tree = viewer.model && viewer.model.getInstanceTree();
-  let base = null;
-  if (tree && dbId != null) {
-    let id = dbId, guard = 0;
-    while (id != null && guard++ < 32) {
-      const b = assetBaseFor(tree.getNodeName(id));
-      if (b) { base = b; break; }
-      const p = tree.getNodeParentId(id);
-      if (p === id) break;
-      id = p;
+// Map each registered asset to the set of fragments sitting on top of it, by
+// proximity to its AUTHORED position. Built once, before anything has moved, so
+// fragment world-bounds reflect their authored placement.
+function buildAssetFrags() {
+  try {
+    const tree = viewer.model.getInstanceTree();
+    const fl = viewer.model.getFragmentList();
+    if (!tree || !fl) return;
+    const box = new THREE.Box3();
+    const frags = [];               // {fragId, x, y} for all movable fragments
+    for (const dbId of movableDbIds()) {
+      tree.enumNodeFragments(dbId, fragId => {
+        fl.getWorldBounds(fragId, box);
+        const c = box.center();
+        frags.push({ fragId, x: c.x, y: c.y });
+      });
     }
-  }
-  if (!base && worldPt) base = nearestAsset(worldPt, 1.75);
-  if (!base) return null;
-  let dbIds = dbIdsForAsset(base);
-  if (!dbIds.length && dbId != null) dbIds = [dbId];   // name-mangled fallback
-  return dbIds.length ? { name: base, dbIds } : null;
+    assetFrags = {};
+    for (const name in assetByName) {
+      const w = utmToWorldXY(assetByName[name].utm);
+      assetFrags[name] = frags
+        .filter(f => Math.hypot(f.x - w.x, f.y - w.y) <= CLUSTER_R)
+        .map(f => f.fragId);
+    }
+    console.log("asset fragment clusters:",
+      Object.fromEntries(Object.entries(assetFrags).map(([k, v]) => [k, v.length])));
+  } catch (e) { console.warn("buildAssetFrags failed", e); assetFrags = {}; }
 }
 
-// Move an asset to an absolute offset (metres) from its authored anchor. Deltas
-// are translation-invariant, so the same (dx,dy) is applied to every fragment
-// of every sub-part — the whole asset slides rigidly.
-function moveAsset(dbIds, dx, dy) {
+function fragsForAsset(name) {
+  if (!assetFrags) buildAssetFrags();
+  return (assetFrags && assetFrags[name]) || [];
+}
+
+// The single movable asset under a hit (from hitTest), or null. Cheap: a node
+// name check plus nearest-asset lookup — does NOT build fragment clusters, so
+// it's safe to call on every hover.
+function assetNameAt(hit) {
+  if (!hit || !sceneMeta) return null;
+  const pt = hit.intersectPoint || hit.point;
+  if (!pt) return null;
   const tree = viewer.model.getInstanceTree();
-  for (const dbId of dbIds) {
-    tree.enumNodeFragments(dbId, fragId => {
-      const fp = viewer.impl.getFragmentProxy(viewer.model, fragId);
-      fp.getAnimTransform();
-      fp.position.x = dx; fp.position.y = dy;
-      fp.updateAnimTransform();
-    });
+  const nm = (tree && tree.getNodeName(hit.dbId)) || "";
+  if (NONMOVABLE_RE.test(nm)) return null;          // grabbed ground/building
+  return nearestAsset(pt, CLUSTER_R + 1.0);         // must be near a real asset
+}
+
+// Full pick for a grab/placement: {name, fragIds, reg}. Builds the asset's
+// fragment cluster (lazily, once) on top of assetNameAt.
+function pickAt(hit) {
+  const name = assetNameAt(hit);
+  if (!name) return null;
+  const fragIds = fragsForAsset(name).slice();
+  if (hit.fragId != null && fragIds.indexOf(hit.fragId) < 0) fragIds.push(hit.fragId);
+  return fragIds.length ? { name, fragIds, reg: assetByName[name] } : null;
+}
+
+// Translate a set of fragments by an absolute offset (metres) from their
+// authored placement. The same (dx,dy) applied to each fragment slides the
+// asset rigidly.
+function moveFrags(fragIds, dx, dy) {
+  for (const fragId of fragIds) {
+    const fp = viewer.impl.getFragmentProxy(viewer.model, fragId);
+    fp.getAnimTransform();
+    fp.position.x = dx; fp.position.y = dy;
+    fp.updateAnimTransform();
   }
   viewer.impl.invalidate(true, true, true);
 }
@@ -270,14 +303,14 @@ function currentOffset(name, reg) {
 }
 
 // Persist a finished move (as a UTM delta) and re-price; skips no-op nudges.
-function commitMove(name, dbIds, fromUtm, off) {
+function commitMove(name, fragIds, fromUtm, off) {
   const reg = assetByName[name];
   const toUtm = [reg.utm[0] + off.x, reg.utm[1] + off.y, reg.utm[2]];
   if (Math.hypot(toUtm[0] - fromUtm[0], toUtm[1] - fromUtm[1]) < 0.05) {
     setStatus("", 0);
     return;
   }
-  history.push({ name, dbIds, from: fromUtm });
+  history.push({ name, fragIds, from: fromUtm });
   placed[name] = toUtm;
   postEdit({ op: "relocate", target: name, asset_type: reg.type,
              from_utm: fromUtm, to_utm: toUtm });
@@ -289,10 +322,7 @@ function installDragTool() {
   if (dragTool || !viewer.toolController) return;
   let drag = null;
   const ground = ev => viewer.impl.intersectGround(ev.clientX, ev.clientY);
-  const hitPick = ev => {
-    const hit = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
-    return hit ? pickAsset(hit.dbId, hit.intersectPoint || hit.point) : null;
-  };
+  const pickEv = ev => pickAt(viewer.impl.hitTest(ev.canvasX, ev.canvasY, false));
 
   dragTool = {
     getNames: () => ["sf-drag"],
@@ -302,19 +332,18 @@ function installDragTool() {
     deactivate: () => { drag = null; },
 
     handleButtonDown: (ev, button) => {
+      if (relocateMode) return false;  // button flow owns clicks while armed
       if (button !== 0 || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
-      const pick = hitPick(ev);
+      const pick = pickEv(ev);
       const g = pick && ground(ev);
       if (!pick || !g) return false;   // not an asset -> let the camera orbit
-      const reg = assetByName[pick.name];
       drag = {
-        name: pick.name, dbIds: pick.dbIds,
-        fromUtm: placed[pick.name] || reg.utm,
+        name: pick.name, fragIds: pick.fragIds,
+        fromUtm: placed[pick.name] || pick.reg.utm,
         startGround: { x: g.x, y: g.y },
-        startOff: currentOffset(pick.name, reg),
+        startOff: currentOffset(pick.name, pick.reg),
       };
       drag.lastOff = drag.startOff;
-      if (nameDb[pick.name] != null) viewer.select(nameDb[pick.name]);
       viewer.container.style.cursor = "grabbing";
       setStatus(`Dragging "${pick.name}" — release to place`);
       return true;                     // consume so the camera doesn't move
@@ -322,15 +351,17 @@ function installDragTool() {
 
     handleMouseMove: ev => {
       if (!drag) {                      // hover: hint that the asset is grabbable
-        if (viewer.container.style.cursor !== "grabbing")
-          viewer.container.style.cursor = hitPick(ev) ? "grab" : "";
+        if (!relocateMode && viewer.container.style.cursor !== "grabbing") {
+          const hit = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
+          viewer.container.style.cursor = assetNameAt(hit) ? "grab" : "";
+        }
         return false;
       }
       const g = ground(ev);
       if (g) {                          // keep the grab point under the cursor
         const dx = drag.startOff.x + (g.x - drag.startGround.x);
         const dy = drag.startOff.y + (g.y - drag.startGround.y);
-        moveAsset(drag.dbIds, dx, dy);
+        moveFrags(drag.fragIds, dx, dy);
         drag.lastOff = { x: dx, y: dy };
       }
       return true;
@@ -340,7 +371,7 @@ function installDragTool() {
       if (!drag) return false;
       const d = drag; drag = null;
       viewer.container.style.cursor = "grab";
-      commitMove(d.name, d.dbIds, d.fromUtm, d.lastOff);
+      commitMove(d.name, d.fragIds, d.fromUtm, d.lastOff);
       return true;
     },
   };
@@ -351,16 +382,14 @@ function installDragTool() {
   } catch (e) { console.warn("drag tool install failed", e); }
 }
 
-// --- button flow: select an asset, then click a ground destination -----------
+// --- button flow: click an asset to pick it up, then click its destination ---
+// (Same single-asset picking as drag; handy on touch / when orbiting is fiddly.)
 
 function startRelocate() {
-  if (selected == null) return alert("Select an asset first — or just drag it.");
-  const pick = pickAsset(selected, null);
-  if (!pick) return alert("That object isn't a movable asset. Movable: cars, trees, push-buttons. Drag one directly, or select it first.");
-  relocatePick = pick;
+  relocatePick = null;
   relocateMode = true;
-  setStatus(`Click the ground to place "${pick.name}"  (Esc to cancel)`);
-  viewer.container.addEventListener("click", onPlace, true);
+  setStatus("Relocate: click an asset to pick it up  (Esc to cancel)");
+  viewer.container.addEventListener("click", onRelocateClick, true);
   document.addEventListener("keydown", onCancelRelocate, true);
 }
 
@@ -373,28 +402,32 @@ function onCancelRelocate(ev) {
 function endRelocate() {
   relocateMode = false;
   relocatePick = null;
-  viewer.container.removeEventListener("click", onPlace, true);
+  viewer.container.removeEventListener("click", onRelocateClick, true);
   document.removeEventListener("keydown", onCancelRelocate, true);
 }
 
-// Convert a clicked ground point (viewer world coords) to UTM, move the armed
-// asset there, persist the relocate edit, and re-price.
-function onPlace(ev) {
+// First click picks the asset under the cursor; second click places it on the
+// ground. (Container is full-window, so client coords == canvas coords.)
+function onRelocateClick(ev) {
   ev.stopPropagation(); ev.preventDefault();
+  if (!relocatePick) {
+    const pick = pickAt(viewer.impl.hitTest(ev.clientX, ev.clientY, false));
+    if (!pick) { setStatus("Not a movable asset — click a car, tree or push-button", 2500); return; }
+    relocatePick = { ...pick, fromUtm: placed[pick.name] || pick.reg.utm };
+    setStatus(`Picked "${pick.name}" — click its destination  (Esc to cancel)`);
+    return;
+  }
+  const g = viewer.impl.intersectGround(ev.clientX, ev.clientY);
+  if (!g || !sceneMeta) { setStatus("placement failed — click on the ground", 2500); return; }
   const pick = relocatePick;
   endRelocate();
-  const g = viewer.impl.intersectGround(ev.clientX, ev.clientY);
-  if (!g || !pick || !sceneMeta) { setStatus("placement failed", 2500); return; }
-
-  // model space = world + globalOffset (the viewer subtracts it for rendering);
-  // UTM = model-local + scene origin. Deltas are translation-invariant.
-  const reg = assetByName[pick.name];
+  // ground point -> UTM -> offset from the asset's authored anchor
   const off = (viewer.model.getData().globalOffset) || { x: 0, y: 0 };
   const o = sceneMeta.origin || [0, 0];
-  const fromUtm = placed[pick.name] || reg.utm;
-  const delta = { x: g.x + off.x + o[0] - reg.utm[0], y: g.y + off.y + o[1] - reg.utm[1] };
-  moveAsset(pick.dbIds, delta.x, delta.y);
-  commitMove(pick.name, pick.dbIds, fromUtm, delta);
+  const delta = { x: g.x + off.x + o[0] - pick.reg.utm[0],
+                  y: g.y + off.y + o[1] - pick.reg.utm[1] };
+  moveFrags(pick.fragIds, delta.x, delta.y);
+  commitMove(pick.name, pick.fragIds, pick.fromUtm, delta);
 }
 
 function postEdit(edit) {
@@ -418,23 +451,25 @@ function undoEdit() {
     if (h && assetByName[h.name]) {
       const reg = assetByName[h.name];
       placed[h.name] = h.from;
-      const dbIds = (h.dbIds && h.dbIds.length) ? h.dbIds : dbIdsForAsset(h.name);
-      moveAsset(dbIds, h.from[0] - reg.utm[0], h.from[1] - reg.utm[1]);
+      const fragIds = (h.fragIds && h.fragIds.length) ? h.fragIds : fragsForAsset(h.name);
+      moveFrags(fragIds, h.from[0] - reg.utm[0], h.from[1] - reg.utm[1]);
     }
     setStatus("undid last edit", 2000);
   }).catch(err => { setStatus("undo failed", 3000); console.error(err); });
 }
 
-// Debug/verification hook — exposes what the loaded SVF2 tree offers vs the
-// registry, and whether each asset resolves for dragging.
+// Debug/verification hook — the SVF2 node names, which are movable, and how
+// many fragments cluster onto each asset (should be a small handful, not all).
 window.__sfDebug = function () {
-  const out = { assets: Object.keys(assetByName), leaves: Object.keys(nameDb), resolved: {} };
-  for (const name in assetByName) {
-    const id = nameDb[name];
-    const p = id != null ? pickAsset(id, null) : null;
-    out.resolved[name] = { dbId: id ?? null, resolvesTo: p ? p.name : null, parts: p ? p.dbIds.length : 0 };
-  }
-  return out;
+  if (!assetFrags) buildAssetFrags();
+  const clusters = {};
+  for (const name in assetByName) clusters[name] = (assetFrags[name] || []).length;
+  return {
+    assets: Object.keys(assetByName),
+    nodes: Object.keys(nameDb),
+    movableNodeIds: movableDbIds(),
+    fragmentsPerAsset: clusters,
+  };
 };
 
 // --- live cost panel (running total of the proposal) -------------------------
