@@ -50,11 +50,22 @@ cy = float(os.environ.get("ROI_CY", cy))
 bbox_proj = (cx - ROI_M / 2, cy - ROI_M / 2, cx + ROI_M / 2, cy + ROI_M / 2)
 print("ROI bbox_proj:", bbox_proj)
 
-# PDAL: stream + crop to ROI, then SMRF ground classification
-pl = pdal.Pipeline(json.dumps({"pipeline": [
-    LAS,
+# PDAL pass 1: crop to ROI in streaming mode (readers.las + filters.crop are
+# both streamable, so the full tile is never loaded into memory at once) and
+# write the small cropped result to a temp file.
+cropped = "out/_cropped.las"
+os.makedirs("out", exist_ok=True)
+crop_pl = pdal.Pipeline(json.dumps({"pipeline": [
+    {"type": "readers.las", "filename": LAS},
     {"type": "filters.crop",
      "bounds": f"([{bbox_proj[0]},{bbox_proj[2]}],[{bbox_proj[1]},{bbox_proj[3]}])"},
+    {"type": "writers.las", "filename": cropped},
+]}))
+crop_pl.execute_streaming(chunk_size=1_000_000)
+
+# PDAL pass 2: SMRF ground classification on the (now small) cropped point set.
+pl = pdal.Pipeline(json.dumps({"pipeline": [
+    cropped,
     {"type": "filters.smrf"},
 ]}))
 pl.execute()
@@ -219,7 +230,7 @@ with zipfile.ZipFile("out/scene_cad.zip", "w", zipfile.ZIP_DEFLATED) as z:
 
 # APS: upload under a fresh key (avoids stale SVF2 cache) -> translate -> URN
 tok = get_token()
-bucket = "cyvl-hack-xavier"
+bucket = os.environ.get("APS_BUCKET", f"cb-{config.APS_CLIENT_ID[:12].lower()}")
 ensure_bucket(tok, bucket)
 object_key = os.environ.get("SCENE_KEY", "scene_cad_v1.zip")
 urn = upload_object(tok, bucket, object_key, "out/scene_cad.zip")

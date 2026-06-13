@@ -29,8 +29,8 @@ def crop_xy(points, bbox_proj):
 
 
 def las_crs(laz_path):
-    las = laspy.read(laz_path)
-    crs = las.header.parse_crs()
+    with laspy.open(laz_path) as f:
+        crs = f.header.parse_crs()
     if crs is None:
         raise ValueError("LAS has no CRS; run `pdal info <file>` to find it and hardcode")
     return crs
