@@ -21,6 +21,18 @@ On top of that base, StreetForge prices street interventions. See
     whole-block repair estimate to `out/estimate.{md,json}`.
   - Viewer: roads render colored by condition; the **Cost estimate** button shows
     the itemized total (served from `/api/estimate`).
+- **Phase 2 — interactive asset repositioning.**
+  - `pipeline/scenario.py`: the proposal JSON (`{block_id, crs, edits}`) that is
+    the source of truth; `pipeline/clearance.py`: building-footprint / curb-offset
+    / ROI checks; `pipeline/cost.py` relocate gains optional per-meter run cost.
+  - `pipeline/scene_export.py` + `run.py` write `out/scene_meta.json`,
+    `out/assets.json` (authored UTM per draggable object), and
+    `out/obstacles.json` for clearance.
+  - `viewer/token_server.py` adds `GET/POST /api/scenario` (persist + re-price +
+    clearance), `/api/scene_meta`, `/api/assets`.
+  - Viewer: select an asset → **Relocate selected** → click the ground to place
+    it. The move persists to the scenario, the cost panel updates live, and any
+    clearance violation shows as a warning. **Undo** reverts the last edit.
 
 ## Setup
 - `python3.11 -m venv .venv && source .venv/bin/activate`
@@ -50,8 +62,10 @@ On top of that base, StreetForge prices street interventions. See
 ## Tests
 `pytest -v`  (no PDAL/data needed — synthetic fixtures). Covers the segmenter
 plus the StreetForge additions: `test_cost.py`, `test_pavement.py`,
-`test_ground_mesh.py`, `test_cyvl_source.py`, and the `test_phase1_integration.py`
-end-to-end (grid → condition → binned mesh → priced report).
+`test_ground_mesh.py`, `test_cyvl_source.py`, `test_phase1_integration.py`
+(grid → condition → binned mesh → priced report), and Phase 2 —
+`test_scenario.py`, `test_clearance.py`, `test_scene_export.py`,
+`test_scenario_endpoint.py` (the `/api/scenario` request logic, no socket).
 
 ## Note
 `run.py` writes `out/classified.laz`; writing `.laz` needs the LAZ backend

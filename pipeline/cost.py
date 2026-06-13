@@ -212,13 +212,26 @@ def _price_repave(edit, catalog, objects) -> list[LineItem]:
 def _price_relocate(edit, catalog, objects) -> list[LineItem]:
     asset_type = _infer_asset_type(edit, objects)
     table = catalog["relocation"]
-    unit_cost = float(table.get(asset_type, table["default"]))
-    dist = _move_distance_m(edit)
+    base = float(table.get(asset_type, table["default"]))
+    dist = edit.get("distance_m")
+    if dist is None:
+        dist = _move_distance_m(edit)
+
     desc = f"relocate {asset_type.replace('_', ' ')}"
     if dist is not None:
         desc += f" ({dist:.1f} m)"
-    return [LineItem("relocate", desc, 1, "each", unit_cost, unit_cost,
-                     target=edit.get("target"))]
+    items = [LineItem("relocate", desc, 1, "each", base, base,
+                      target=edit.get("target"))]
+
+    # optional per-meter run cost (e.g. trenching/wiring for utility moves)
+    per_m_table = catalog.get("relocation_per_m") or {}
+    per_m = float(per_m_table.get(asset_type, per_m_table.get("default", 0.0)))
+    if per_m and dist:
+        run = dist * per_m
+        items.append(LineItem("relocate", f"{asset_type.replace('_', ' ')} run",
+                              round(dist, 1), "linear m", per_m, run,
+                              target=edit.get("target")))
+    return items
 
 
 def _price_add_ramp(edit, catalog, objects) -> list[LineItem]:

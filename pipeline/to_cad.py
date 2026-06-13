@@ -87,7 +87,8 @@ def car_objects(cars):
         yaw = b.get("yaw", 0.0)
         z0 = cz - H / 2
         bv, bf = mesh_box((cx, cy, z0 + 0.35 * H), (L, W, 0.7 * H), yaw)
-        objs.append({"name": f"car_{i:02d}", "material": "car", "verts": bv, "faces": bf})
+        objs.append({"name": f"car_{i:02d}", "material": "car", "verts": bv,
+                     "faces": bf, "anchor": [cx, cy, cz]})
         # cabin sits on the body, slightly rearward along the car axis
         off = -0.08 * L
         ox, oy = off * math.cos(yaw), off * math.sin(yaw)
@@ -107,6 +108,7 @@ def asset_objects(assets):
         x, y, z0 = a["x"], a["y"], a["ground_z"]
         H = max(a["height"], 0.3)
         nm = f"{t.lower()}_{i:02d}"
+        start = len(objs)            # tag the base object with its drag anchor
         if t == "TREE":
             tv, tf = mesh_cylinder(x, y, z0, 0.15, 0.40 * H)
             objs.append({"name": nm, "material": "trunk", "verts": tv, "faces": tf})
@@ -129,6 +131,8 @@ def asset_objects(assets):
         else:
             bv, bf = mesh_box((x, y, z0 + H / 2), (0.5, 0.5, H))
             objs.append({"name": nm, "material": "misc", "verts": bv, "faces": bf})
+        if len(objs) > start:       # base object carries the relocation anchor
+            objs[start]["anchor"] = [x, y, z0]
     return objs
 
 

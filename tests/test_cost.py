@@ -63,6 +63,22 @@ def test_relocate_unknown_type_falls_back_to_default():
     assert r.total == pytest.approx(1500.0)
 
 
+def test_relocate_distance_scaling_adds_run_line_item():
+    catalog = {**CATALOG, "relocation_per_m": {"utility_pole": 50.0}}
+    r = estimate([{"op": "relocate", "asset_type": "utility_pole",
+                   "from_utm": [0, 0, 0], "to_utm": [0, 10, 0]}], catalog)
+    # base 8000 + 10 m * 50 = 8500, split across two line items
+    assert len(r.line_items) == 2
+    assert r.total == pytest.approx(8500.0)
+
+
+def test_relocate_no_scaling_when_table_absent():
+    r = estimate([{"op": "relocate", "asset_type": "utility_pole",
+                   "from_utm": [0, 0, 0], "to_utm": [0, 10, 0]}], CATALOG)
+    assert len(r.line_items) == 1
+    assert r.total == pytest.approx(8000.0)
+
+
 def test_add_ramp_is_per_each():
     r = estimate([{"op": "add_ramp", "at_utm": [1, 2, 3]}], CATALOG)
     assert r.total == pytest.approx(2500.0)

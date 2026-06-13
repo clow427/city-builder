@@ -190,13 +190,26 @@ edits = [{"op": "repave", "target": o["name"],
          for o in ground_objs
          if o["name"].rsplit("_", 1)[1] in TREATMENT_FOR_BIN
          and o["name"].startswith("ground_road_")]
+os.makedirs("out", exist_ok=True)
 if edits:
     report = estimate(edits, load_catalog())
-    os.makedirs("out", exist_ok=True)
     report.write("out/estimate.md")
     report.write("out/estimate.json")
     print(f"baseline repair estimate: ${report.total:,.2f} "
           f"({len(edits)} road sections) -> out/estimate.md")
+
+# Phase 2 artifacts: let the viewer map local<->UTM, know each draggable asset's
+# authored position, and clearance-check relocations against buildings/curbs.
+from pipeline.scene_export import asset_registry, scene_meta, obstacles
+crs_str = f"EPSG:{crs.to_epsg()}" if crs.to_epsg() else crs.to_string()
+block_id = os.environ.get("BLOCK_ID") or os.path.splitext(os.path.basename(LAS))[0]
+json.dump(scene_meta(block_id, crs_str, (ox, oy), ROI_M, CELL, bbox_proj),
+          open("out/scene_meta.json", "w"))
+json.dump(asset_registry(objs, (ox, oy)), open("out/assets.json", "w"))
+json.dump(obstacles([b["poly"] for b in builds], road_zone, bbox_proj, crs_str),
+          open("out/obstacles.json", "w"))
+print(f"wrote scene_meta/assets ({len(asset_registry(objs, (ox, oy)))} draggable)"
+      f"/obstacles to out/")
 
 # zip OBJ + MTL (Model Derivative needs a zip for multi-file inputs)
 import zipfile
