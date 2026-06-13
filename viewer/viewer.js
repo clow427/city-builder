@@ -9,8 +9,9 @@ let assetByName = {};          // name -> {name, type, utm:[x,y,z]} authored pos
 let nameDb = {};               // object name -> viewer dbId
 let placed = {};               // name -> current UTM (after moves)
 let history = [];              // [{name, from}] for undo
-let removed = {};              // name -> dbId for hidden/removed assets
+let removed = {};              // name -> fragIds[] for fragment-level hidden assets
 let relocateMode = false;
+let removeMode = false;
 
 // Scene selector
 let scenes = [];
@@ -23,8 +24,18 @@ let roads = [];                // [{name, mesh}] live road overlays
 let roadPreview = null;        // rubber-band mesh shown while aiming
 let roadOverlayReady = false;  // is the "roads" overlay scene created
 let roadSeq = 0;               // highest road_NN index seen, for naming
-const ROAD_LIFT = 0.05;        // metres above the sampled surface (anti z-fight)
-const ROAD_COLOR = 0x3b3b3b;   // asphalt grey
+const ROAD_LIFT = 0.04;        // metres above the sampled surface (anti z-fight)
+const ROAD_COLOR = 0x222222;   // dark asphalt, matches existing streets
+
+// Green terrain fill tool — two-corner rectangle, draped over surface
+let greenBuildMode = false;
+let greenStart = null;         // world point of the first corner {x,y,z}
+let greens = [];               // [{name, mesh}] live green overlays
+let greenPreview = null;
+let greenOverlayReady = false;
+let greenSeq = 0;
+const GREEN_LIFT = 0.10;       // higher than ROAD_LIFT so green covers roads
+const GREEN_COLOR = 0x3a7d3a;
 
 Autodesk.Viewing.Initializer({
   env: "AutodeskProduction2", api: "streamingV2",
@@ -59,8 +70,11 @@ function loadScene(s) {
   nameDb = {}; assetByName = {}; placed = {}; history = []; removed = {}; sceneMeta = null;
   assetFrags = null;
   endRelocate();
+  endRemoveMode();
   endBuildRoad();
+  endBuildGreen();
   clearRoads();
+  clearGreens();
 
   if (lidarPoints) {
     if (lidarVisible) viewer.impl.removeOverlay("lidar", lidarPoints);
@@ -107,6 +121,7 @@ function loadScene(s) {
       .then(setHumanView)
       .then(loadSceneData)
       .then(loadRoads)
+      .then(loadGreens)
       .then(refreshCost);
   }, err => console.error("load failed", err));
 }
@@ -171,38 +186,61 @@ function togglePoints() {
   viewer.impl.invalidate(true, true, true);
 }
 
-// Reverse-lookup: dbId -> object name via nameDb.
-function dbIdToName(dbId) {
-  for (const [name, id] of Object.entries(nameDb)) {
-    if (id === dbId) return name;
+// Scale fragments to 0 / 1 to hide or restore a specific asset without touching
+// other assets that share the same material node (same as how drag works).
+function hideFrags(fragIds) {
+  for (const fragId of fragIds) {
+    const fp = viewer.impl.getFragmentProxy(viewer.model, fragId);
+    fp.getAnimTransform();
+    fp.scale.x = 0; fp.scale.y = 0; fp.scale.z = 0;
+    fp.updateAnimTransform();
   }
-  return null;
+  viewer.impl.invalidate(true, true, true);
 }
 
-// If `name` is a sub-component (e.g. car_01_cabin, tree_01_canopy) find the
-// registered base asset it belongs to (car_01, tree_01).
-function assetNameOf(name) {
-  if (!name) return null;
-  if (assetByName[name]) return name;
-  for (const aname of Object.keys(assetByName)) {
-    if (name.startsWith(aname + "_")) return aname;
+function showFrags(fragIds) {
+  for (const fragId of fragIds) {
+    const fp = viewer.impl.getFragmentProxy(viewer.model, fragId);
+    fp.getAnimTransform();
+    fp.scale.x = 1; fp.scale.y = 1; fp.scale.z = 1;
+    fp.updateAnimTransform();
   }
-  return name;
+  viewer.impl.invalidate(true, true, true);
 }
 
-// Hide the selected object and post a remove edit so the cost engine prices it.
-// Cars (LiDAR-detected parked vehicles) have a $0 removal cost per the catalog.
-function removeAsset() {
-  if (selected == null) return alert("Select an object first");
-  const rawName = dbIdToName(selected);
-  viewer.hide(selected);
-  const name = assetNameOf(rawName) || rawName;
-  if (name) {
-    removed[name] = selected;
-    const reg = assetByName[name];
-    const assetType = reg ? reg.type : name.replace(/_\d+$/, "").toLowerCase();
-    postEdit({ op: "remove", target: name, asset_type: assetType }, `removed ${name}`);
-  }
+// Click-to-remove flow — mirrors startRelocate() so the user clicks the exact
+// asset they want to remove rather than whatever group the selection falls on.
+function startRemoveAsset() {
+  endRelocate();
+  removeMode = true;
+  setStatus("Remove: click an asset to remove it  (Esc to cancel)");
+  viewer.container.addEventListener("click", onRemoveClick, true);
+  document.addEventListener("keydown", onCancelRemove, true);
+}
+
+function onCancelRemove(ev) {
+  if (ev.key !== "Escape") return;
+  endRemoveMode();
+  setStatus("remove cancelled", 1500);
+}
+
+function endRemoveMode() {
+  removeMode = false;
+  viewer.container && viewer.container.removeEventListener("click", onRemoveClick, true);
+  document.removeEventListener("keydown", onCancelRemove, true);
+}
+
+function onRemoveClick(ev) {
+  ev.stopPropagation(); ev.preventDefault();
+  const hit = viewer.impl.hitTest(ev.clientX, ev.clientY, false);
+  const name = assetNameAt(hit);
+  if (!name) { setStatus("Not a removable asset — click a car, tree or infrastructure item", 2500); return; }
+  endRemoveMode();
+  const fragIds = fragsForAsset(name).slice();
+  if (fragIds.length) { hideFrags(fragIds); removed[name] = fragIds; }
+  const reg = assetByName[name];
+  const assetType = reg ? reg.type : name.replace(/_\d+$/, "").toLowerCase();
+  postEdit({ op: "remove", target: name, asset_type: assetType }, `removed ${name}`);
 }
 
 // --- scene data + status -----------------------------------------------------
@@ -238,6 +276,7 @@ function setStatus(msg, ms) {
 // assets are moved around. This also works on object-separated models.
 
 let relocatePick = null;   // {name, fragIds, reg} armed by the button flow
+let relocateRoad = null;   // {road, grab:{x,y}} when a street is picked to relocate
 let dragTool = null;
 let assetFrags = null;     // name -> [fragId], built once per scene (see below)
 
@@ -363,59 +402,95 @@ function commitMove(name, fragIds, fromUtm, off) {
 
 function installDragTool() {
   if (dragTool || !viewer.toolController) return;
-  let drag = null;
+  let drag = null;        // asset drag (fragment cluster)
+  let roadDrag = null;    // street drag (overlay ribbon)
   const ground = ev => viewer.impl.intersectGround(ev.clientX, ev.clientY);
   const pickEv = ev => pickAt(viewer.impl.hitTest(ev.canvasX, ev.canvasY, false));
+  // World point under a tool event — surface hit if any, else the ground plane.
+  const worldAt = ev => {
+    const h = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
+    return (h && (h.intersectPoint || h.point)) || ground(ev);
+  };
 
   dragTool = {
     getNames: () => ["sf-drag"],
     getName: () => "sf-drag",
     getPriority: () => 100,            // above the orbit/navigation tools
     activate: () => {},
-    deactivate: () => { drag = null; },
+    deactivate: () => { drag = null; roadDrag = null; },
 
     handleButtonDown: (ev, button) => {
-      if (relocateMode || roadBuildMode) return false;  // other flows own clicks
+      if (relocateMode || roadBuildMode || removeMode || greenBuildMode) return false;
       if (button !== 0 || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
       const pick = pickEv(ev);
       const g = pick && ground(ev);
-      if (!pick || !g) return false;   // not an asset -> let the camera orbit
-      drag = {
-        name: pick.name, fragIds: pick.fragIds,
-        fromUtm: placed[pick.name] || pick.reg.utm,
-        startGround: { x: g.x, y: g.y },
-        startOff: currentOffset(pick.name, pick.reg),
-      };
-      drag.lastOff = drag.startOff;
-      viewer.container.style.cursor = "grabbing";
-      setStatus(`Dragging "${pick.name}" — release to place`);
-      return true;                     // consume so the camera doesn't move
+      if (pick && g) {                 // an asset (car/tree/button) takes priority
+        drag = {
+          name: pick.name, fragIds: pick.fragIds,
+          fromUtm: placed[pick.name] || pick.reg.utm,
+          startGround: { x: g.x, y: g.y },
+          startOff: currentOffset(pick.name, pick.reg),
+        };
+        drag.lastOff = drag.startOff;
+        viewer.container.style.cursor = "grabbing";
+        setStatus(`Dragging "${pick.name}" — release to place`);
+        return true;                   // consume so the camera doesn't move
+      }
+      const w = worldAt(ev);
+      const r = w && roadAt(w);         // no asset -> maybe a street under the cursor
+      if (r) {
+        roadDrag = { road: r, startGround: { x: w.x, y: w.y }, last: { x: 0, y: 0 } };
+        viewer.container.style.cursor = "grabbing";
+        setStatus(`Dragging "${r.name}" — release to place`);
+        return true;
+      }
+      return false;                    // empty ground -> let the camera orbit
     },
 
     handleMouseMove: ev => {
-      if (!drag) {                      // hover: hint that the asset is grabbable
-        if (!relocateMode && !roadBuildMode && viewer.container.style.cursor !== "grabbing") {
-          const hit = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
-          viewer.container.style.cursor = assetNameAt(hit) ? "grab" : "";
+      if (drag) {
+        const g = ground(ev);
+        if (g) {                        // keep the grab point under the cursor
+          const dx = drag.startOff.x + (g.x - drag.startGround.x);
+          const dy = drag.startOff.y + (g.y - drag.startGround.y);
+          moveFrags(drag.fragIds, dx, dy);
+          drag.lastOff = { x: dx, y: dy };
         }
-        return false;
+        return true;
       }
-      const g = ground(ev);
-      if (g) {                          // keep the grab point under the cursor
-        const dx = drag.startOff.x + (g.x - drag.startGround.x);
-        const dy = drag.startOff.y + (g.y - drag.startGround.y);
-        moveFrags(drag.fragIds, dx, dy);
-        drag.lastOff = { x: dx, y: dy };
+      if (roadDrag) {                   // slide the whole ribbon (re-drapes on drop)
+        const w = worldAt(ev);
+        if (w) {
+          roadDrag.last = { x: w.x - roadDrag.startGround.x, y: w.y - roadDrag.startGround.y };
+          roadDrag.road.mesh.position.set(roadDrag.last.x, roadDrag.last.y, 0);
+          viewer.impl.invalidate(true, true, true);
+        }
+        return true;
       }
-      return true;
+      // hover: hint that something grabbable (asset or street) is under the cursor
+      if (!relocateMode && !roadBuildMode && !removeMode && !greenBuildMode && viewer.container.style.cursor !== "grabbing") {
+        const hit = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
+        const grab = assetNameAt(hit) ||
+                     roadAt((hit && (hit.intersectPoint || hit.point)) || ground(ev));
+        viewer.container.style.cursor = grab ? "grab" : "";
+      }
+      return false;
     },
 
     handleButtonUp: (ev, button) => {
-      if (!drag) return false;
-      const d = drag; drag = null;
-      viewer.container.style.cursor = "grab";
-      commitMove(d.name, d.fragIds, d.fromUtm, d.lastOff);
-      return true;
+      if (drag) {
+        const d = drag; drag = null;
+        viewer.container.style.cursor = "grab";
+        commitMove(d.name, d.fragIds, d.fromUtm, d.lastOff);
+        return true;
+      }
+      if (roadDrag) {
+        const rd = roadDrag; roadDrag = null;
+        viewer.container.style.cursor = "grab";
+        commitRoadMove(rd.road, rd.last.x, rd.last.y);
+        return true;
+      }
+      return false;
     },
   };
 
@@ -430,8 +505,9 @@ function installDragTool() {
 
 function startRelocate() {
   relocatePick = null;
+  relocateRoad = null;
   relocateMode = true;
-  setStatus("Relocate: click an asset to pick it up  (Esc to cancel)");
+  setStatus("Relocate: click an asset or road to pick it up  (Esc to cancel)");
   viewer.container.addEventListener("click", onRelocateClick, true);
   document.addEventListener("keydown", onCancelRelocate, true);
 }
@@ -445,6 +521,7 @@ function onCancelRelocate(ev) {
 function endRelocate() {
   relocateMode = false;
   relocatePick = null;
+  relocateRoad = null;
   viewer.container.removeEventListener("click", onRelocateClick, true);
   document.removeEventListener("keydown", onCancelRelocate, true);
 }
@@ -453,11 +530,30 @@ function endRelocate() {
 // ground. (Container is full-window, so client coords == canvas coords.)
 function onRelocateClick(ev) {
   ev.stopPropagation(); ev.preventDefault();
+  // second click for a previously-picked street: shift it by (click - grab)
+  if (relocateRoad) {
+    const w = surfacePointAt(ev.clientX, ev.clientY);
+    if (!w) { setStatus("placement failed — click on the ground", 2500); return; }
+    const r = relocateRoad.road, g0 = relocateRoad.grab;
+    endRelocate();
+    commitRoadMove(r, w.x - g0.x, w.y - g0.y);
+    return;
+  }
   if (!relocatePick) {
     const pick = pickAt(viewer.impl.hitTest(ev.clientX, ev.clientY, false));
-    if (!pick) { setStatus("Not a movable asset — click a car, tree or push-button", 2500); return; }
-    relocatePick = { ...pick, fromUtm: placed[pick.name] || pick.reg.utm };
-    setStatus(`Picked "${pick.name}" — click its destination  (Esc to cancel)`);
+    if (pick) {
+      relocatePick = { ...pick, fromUtm: placed[pick.name] || pick.reg.utm };
+      setStatus(`Picked "${pick.name}" — click its destination  (Esc to cancel)`);
+      return;
+    }
+    const w = surfacePointAt(ev.clientX, ev.clientY);
+    const r = w && roadAt(w);
+    if (r) {
+      relocateRoad = { road: r, grab: { x: w.x, y: w.y } };
+      setStatus(`Picked "${r.name}" — click its destination  (Esc to cancel)`);
+      return;
+    }
+    setStatus("Not movable — click a car, tree, push-button or road", 2500);
     return;
   }
   const g = viewer.impl.intersectGround(ev.clientX, ev.clientY);
@@ -494,9 +590,13 @@ function undoEdit() {
     const u = res.undone;
     if (u && u.op === "add_road") {
       removeRoadByName(u.target);
+    } else if (u && u.op === "move_road") {
+      redrawRoadAt(u.target, u.from_path_utm, u.width_m);
+    } else if (u && u.op === "add_green") {
+      removeGreenByName(u.target);
     } else if (u && u.op === "remove") {
-      const dbId = removed[u.target];
-      if (dbId != null) { viewer.show(dbId); delete removed[u.target]; }
+      const fragIds = removed[u.target];
+      if (fragIds) { showFrags(fragIds); delete removed[u.target]; }
     } else {
       const h = history.pop();
       if (h && assetByName[h.name]) {
@@ -525,12 +625,13 @@ window.__sfDebug = function () {
 };
 
 // --- road building: extend roads across the scene, Cities:Skylines-style -----
-// Two clicks place a straight segment. Each endpoint's elevation is sampled from
-// the surface under it (the road it connects to), and the ribbon slopes between
-// the two — so a new road meets each existing road flush. Width is taken from
-// the toolbar field (metres). Segments render as flat overlay ribbons (they are
-// NOT part of the SVF2 model) and persist as `add_road` edits in the scenario,
-// which the cost engine prices (pavement area + curb both sides).
+// Two clicks place a straight segment. The ribbon is draped over the ground it
+// crosses — subdivided along its length, each cross-section's height sampled from
+// the surface beneath it — so it blankets the terrain/road rather than floating,
+// and meets the existing road flush. Width is taken from the toolbar field
+// (metres). Segments render as dark-asphalt overlay ribbons (they are NOT part of
+// the SVF2 model) and persist as `add_road` edits in the scenario, which the cost
+// engine prices (pavement area + curb both sides).
 
 // World <-> UTM (the scenario's canonical frame). XY uses the scene origin and
 // the model's global offset; Z uses the offset only (origin is 2-D).
@@ -555,25 +656,66 @@ function surfacePointAt(clientX, clientY) {
 
 function horizLength(a, b) { return Math.hypot(b.x - a.x, b.y - a.y); }
 
-// A flat road ribbon between two world points, `width` metres wide, lifted a
-// hair above the surface to avoid z-fighting. Endpoints keep their own Z, so the
-// quad slopes from one to the other.
-function buildRoadMesh(s, e, width, opacity) {
+// Highest point of the model + margin — the ray origin for downward sampling.
+function modelTopZ() {
+  try { return viewer.model.getBoundingBox().max.z + 10; } catch (e) { return 1e4; }
+}
+
+// Surface elevation (world Z) directly under a world XY, by casting a ray
+// straight down against the model (world is Z-up). Returns `fallback` if nothing
+// is hit or the ray API is unavailable on this viewer build — so roads still
+// draw, just flat between their endpoints rather than draped.
+function surfaceZAt(wx, wy, topZ, fallback) {
+  if (!viewer.impl || typeof viewer.impl.rayIntersect !== "function") return fallback;
+  let hit = null;
+  try {
+    const ray = new THREE.Ray(new THREE.Vector3(wx, wy, topZ),
+                              new THREE.Vector3(0, 0, -1));
+    hit = viewer.impl.rayIntersect(ray, true);   // ignoreTransparent
+  } catch (e) { hit = null; }
+  const p = hit && (hit.intersectPoint || hit.point);
+  return p ? p.z : fallback;
+}
+
+// A road ribbon between two world points, `width` metres wide. With draping
+// (opts.drape, the default for committed roads) the ribbon is subdivided along
+// its length and each cross-section's left/right Z is sampled from the surface
+// underneath, so the road blankets the ground it crosses. opts.drape:false makes
+// a single sloped quad (cheap — used for the live aiming preview). Lifted
+// ROAD_LIFT above the surface to avoid z-fighting.
+function buildRoadMesh(s, e, width, opts) {
+  opts = opts || {};
+  const opacity = opts.opacity != null ? opts.opacity : 1;
+  const drape = opts.drape !== false;
   const dx = e.x - s.x, dy = e.y - s.y;
   const len = Math.hypot(dx, dy) || 1e-6;
   const nx = -dy / len, ny = dx / len;         // unit perpendicular in XY
-  const hw = width / 2, px = nx * hw, py = ny * hw;
-  const sz = s.z + ROAD_LIFT, ez = e.z + ROAD_LIFT;
-  const A = [s.x + px, s.y + py, sz], B = [s.x - px, s.y - py, sz];
-  const C = [e.x - px, e.y - py, ez], D = [e.x + px, e.y + py, ez];
-  const pos = new Float32Array([...A, ...B, ...C, ...A, ...C, ...D]);
+  const hw = width / 2;
+  const step = opts.step || 1.5;               // metres between cross-sections
+  const nSeg = drape ? Math.max(1, Math.min(Math.round(len / step), 240)) : 1;
+  const topZ = opts.topZ != null ? opts.topZ : modelTopZ();
+
+  const verts = [];
+  let pL = null, pR = null;                    // previous cross-section corners
+  for (let i = 0; i <= nSeg; i++) {
+    const t = i / nSeg;
+    const cx = s.x + dx * t, cy = s.y + dy * t;
+    const fallZ = s.z + (e.z - s.z) * t;       // interpolated endpoint Z
+    const lx = cx + nx * hw, ly = cy + ny * hw;
+    const rx = cx - nx * hw, ry = cy - ny * hw;
+    const lz = (drape ? surfaceZAt(lx, ly, topZ, fallZ) : fallZ) + ROAD_LIFT;
+    const rz = (drape ? surfaceZAt(rx, ry, topZ, fallZ) : fallZ) + ROAD_LIFT;
+    const Lp = [lx, ly, lz], Rp = [rx, ry, rz];
+    if (pL) verts.push(...pL, ...pR, ...Rp, ...pL, ...Rp, ...Lp);  // bridge to prev
+    pL = Lp; pR = Rp;
+  }
   const geom = new THREE.BufferGeometry();
-  geom.addAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geom.addAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
   geom.computeBoundingBox();
   geom.computeBoundingSphere();
   const mat = new THREE.MeshBasicMaterial({
     color: ROAD_COLOR, side: THREE.DoubleSide,
-    transparent: opacity != null && opacity < 1, opacity: opacity != null ? opacity : 1,
+    transparent: opacity < 1, opacity,
   });
   return new THREE.Mesh(geom, mat);
 }
@@ -587,9 +729,10 @@ function ensureRoadOverlay() {
 // Place a committed road overlay (no persistence — callers persist separately).
 function addRoadOverlay(name, s, e, width) {
   ensureRoadOverlay();
-  const mesh = buildRoadMesh(s, e, width, 1);
+  const mesh = buildRoadMesh(s, e, width, { drape: true });
   viewer.impl.addOverlay("roads", mesh);
-  roads.push({ name, mesh });
+  roads.push({ name, mesh, s: { x: s.x, y: s.y, z: s.z },
+               e: { x: e.x, y: e.y, z: e.z }, width });
   viewer.impl.invalidate(true, true, true);
   return mesh;
 }
@@ -622,6 +765,53 @@ function roadWidth() {
   return (isFinite(w) && w > 0) ? w : 7;
 }
 
+// The road whose footprint (straight ribbon, `width` wide) contains a world XY,
+// topmost first, or null. Overlay ribbons aren't returned by hitTest, so the
+// relocate/drag tools grab a street by testing its 2-D footprint instead.
+function roadAt(pt) {
+  if (!pt) return null;
+  for (let i = roads.length - 1; i >= 0; i--) {
+    const r = roads[i];
+    if (!r.s || !r.e) continue;
+    const dx = r.e.x - r.s.x, dy = r.e.y - r.s.y;
+    const len2 = dx * dx + dy * dy || 1e-9;
+    let t = ((pt.x - r.s.x) * dx + (pt.y - r.s.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(pt.x - (r.s.x + dx * t), pt.y - (r.s.y + dy * t));
+    if (d <= r.width / 2 + 0.5) return r;          // 0.5 m grab tolerance
+  }
+  return null;
+}
+
+// Re-drape a road at endpoints shifted by (dx,dy) and persist the move. Moving a
+// street costs nothing (same pavement) — `move_road` adds no cost line item.
+function commitRoadMove(r, dx, dy) {
+  r.mesh.position.set(0, 0, 0);                    // drop any live drag offset
+  if (Math.hypot(dx, dy) < 0.05) { viewer.impl.invalidate(true, true, true); return; }
+  const fromPath = [worldToUtm(r.s), worldToUtm(r.e)];
+  const top = modelTopZ();
+  const ns = { x: r.s.x + dx, y: r.s.y + dy, z: 0 };
+  const ne = { x: r.e.x + dx, y: r.e.y + dy, z: 0 };
+  ns.z = surfaceZAt(ns.x, ns.y, top, r.s.z);
+  ne.z = surfaceZAt(ne.x, ne.y, top, r.e.z);
+  if (roadOverlayReady) viewer.impl.removeOverlay("roads", r.mesh);
+  r.mesh = buildRoadMesh(ns, ne, r.width, { drape: true });
+  viewer.impl.addOverlay("roads", r.mesh);
+  r.s = ns; r.e = ne;
+  viewer.impl.invalidate(true, true, true);
+  postEdit({ op: "move_road", target: r.name, asset_type: "road",
+             from_path_utm: fromPath, to_path_utm: [worldToUtm(ns), worldToUtm(ne)],
+             width_m: r.width, length_m: horizLength(ns, ne) }, `moved ${r.name}`);
+}
+
+// Remove a road and redraw it (draped) at a UTM path — used to revert a move on undo.
+function redrawRoadAt(name, path_utm, width) {
+  if (!path_utm || path_utm.length < 2) return;
+  removeRoadByName(name);
+  addRoadOverlay(name, utmToWorld(path_utm[0]),
+                 utmToWorld(path_utm[path_utm.length - 1]), width || 7);
+}
+
 // Redraw persisted roads for the current scene from its scenario.
 function loadRoads() {
   return fetch("/api/scenario?scene=" + encodeURIComponent(currentScene.id))
@@ -629,9 +819,12 @@ function loadRoads() {
       const edits = (res.scenario && res.scenario.edits) || [];
       edits.filter(e => e.op === "add_road" && e.path_utm && e.path_utm.length >= 2)
         .forEach(e => {
-          const s = utmToWorld(e.path_utm[0]);
-          const en = utmToWorld(e.path_utm[e.path_utm.length - 1]);
-          addRoadOverlay(e.target, s, en, e.width_m || 7);
+          let path = e.path_utm;                   // current spot = last move, else add
+          for (const mv of edits)
+            if (mv.op === "move_road" && mv.target === e.target && mv.to_path_utm)
+              path = mv.to_path_utm;
+          addRoadOverlay(e.target, utmToWorld(path[0]),
+                         utmToWorld(path[path.length - 1]), e.width_m || 7);
           const m = /_(\d+)$/.exec(e.target || "");
           if (m) roadSeq = Math.max(roadSeq, parseInt(m[1], 10));
         });
@@ -643,6 +836,7 @@ function loadRoads() {
 function startBuildRoad() {
   if (!viewer.model || !sceneMeta) return setStatus("scene still loading…", 2000);
   endRelocate();
+  endBuildGreen();
   roadBuildMode = true;
   roadStart = null;
   clearRoadPreview();
@@ -703,8 +897,174 @@ function onBuildRoadMove(ev) {
   const pt = surfacePointAt(ev.clientX, ev.clientY);
   if (!pt) return;
   clearRoadPreview();
-  roadPreview = buildRoadMesh(roadStart, { x: pt.x, y: pt.y, z: pt.z }, roadWidth(), 0.45);
+  roadPreview = buildRoadMesh(roadStart, { x: pt.x, y: pt.y, z: pt.z }, roadWidth(), { opacity: 0.45, drape: false });
   viewer.impl.addOverlay("roads", roadPreview);
+  viewer.impl.invalidate(true, true, true);
+}
+
+// --- green terrain fill tool -------------------------------------------------
+// Two clicks define opposite corners of a rectangle. The patch is draped over
+// the surface (same ray-sampling as roads) and rendered above roads (GREEN_LIFT
+// > ROAD_LIFT) so it blankets existing asphalt when painted over a road.
+// Persists as `add_green` edits priced by area (topsoil + sod per sq ft).
+
+function buildGreenMesh(s, e, opts) {
+  opts = opts || {};
+  const opacity = opts.opacity != null ? opts.opacity : 1;
+  const drape = opts.drape !== false;
+  const topZ = opts.topZ != null ? opts.topZ : modelTopZ();
+  const step = 2.0;
+  const dx = e.x - s.x, dy = e.y - s.y;
+  const nX = drape ? Math.max(1, Math.round(Math.abs(dx) / step)) : 1;
+  const nY = drape ? Math.max(1, Math.round(Math.abs(dy) / step)) : 1;
+  const fallZ = (s.z + e.z) / 2;
+
+  function cellZ(x, y) {
+    if (drape) return surfaceZAt(x, y, topZ, fallZ) + GREEN_LIFT;
+    // For the live preview, interpolate endpoint Z — no ray casting needed.
+    const tx = dx ? (x - s.x) / dx : 0.5;
+    const ty = dy ? (y - s.y) / dy : 0.5;
+    return s.z + (e.z - s.z) * (tx * 0.5 + ty * 0.5) + GREEN_LIFT;
+  }
+
+  const verts = [];
+  for (let j = 0; j < nY; j++) {
+    for (let i = 0; i < nX; i++) {
+      const x0 = s.x + dx * (i / nX),       y0 = s.y + dy * (j / nY);
+      const x1 = s.x + dx * ((i + 1) / nX), y1 = s.y + dy * ((j + 1) / nY);
+      const z00 = cellZ(x0, y0), z10 = cellZ(x1, y0);
+      const z01 = cellZ(x0, y1), z11 = cellZ(x1, y1);
+      verts.push(x0, y0, z00,  x1, y0, z10,  x1, y1, z11);
+      verts.push(x0, y0, z00,  x1, y1, z11,  x0, y1, z01);
+    }
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.addAttribute("position", new THREE.BufferAttribute(new Float32Array(verts), 3));
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+  const mat = new THREE.MeshBasicMaterial({
+    color: GREEN_COLOR, side: THREE.DoubleSide,
+    transparent: opacity < 1, opacity,
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
+function ensureGreenOverlay() {
+  if (greenOverlayReady) return;
+  viewer.impl.createOverlayScene("greens");
+  greenOverlayReady = true;
+}
+
+function addGreenOverlay(name, s, e) {
+  ensureGreenOverlay();
+  const mesh = buildGreenMesh(s, e, { drape: true });
+  viewer.impl.addOverlay("greens", mesh);
+  greens.push({ name, mesh, s, e });
+  viewer.impl.invalidate(true, true, true);
+  return mesh;
+}
+
+function removeGreenByName(name) {
+  const i = greens.findIndex(g => g.name === name);
+  if (i < 0) return;
+  if (greenOverlayReady) viewer.impl.removeOverlay("greens", greens[i].mesh);
+  greens.splice(i, 1);
+  viewer.impl.invalidate(true, true, true);
+}
+
+function clearGreens() {
+  if (greenOverlayReady) {
+    for (const g of greens) viewer.impl.removeOverlay("greens", g.mesh);
+    viewer.impl.removeOverlayScene("greens");
+  }
+  greens = []; greenOverlayReady = false; greenSeq = 0;
+  greenStart = null; greenPreview = null;
+}
+
+function clearGreenPreview() {
+  if (greenPreview && greenOverlayReady) viewer.impl.removeOverlay("greens", greenPreview);
+  greenPreview = null;
+}
+
+// Restore persisted green patches from the scenario on scene load.
+function loadGreens() {
+  return fetch("/api/scenario?scene=" + encodeURIComponent(currentScene.id))
+    .then(r => r.json()).then(res => {
+      const edits = (res.scenario && res.scenario.edits) || [];
+      edits.filter(e => e.op === "add_green" && e.start_utm && e.end_utm)
+        .forEach(e => {
+          const s = utmToWorld(e.start_utm), en = utmToWorld(e.end_utm);
+          addGreenOverlay(e.target, s, en);
+          const m = /_(\d+)$/.exec(e.target || "");
+          if (m) greenSeq = Math.max(greenSeq, parseInt(m[1], 10));
+        });
+    }).catch(() => {});
+}
+
+function startBuildGreen() {
+  if (!viewer.model || !sceneMeta) return setStatus("scene still loading…", 2000);
+  endRelocate();
+  endBuildRoad();
+  greenBuildMode = true;
+  greenStart = null;
+  clearGreenPreview();
+  ensureGreenOverlay();
+  viewer.container.style.cursor = "crosshair";
+  setStatus("Fill green: click the first corner  (Esc to cancel)");
+  viewer.container.addEventListener("click", onBuildGreenClick, true);
+  viewer.container.addEventListener("mousemove", onBuildGreenMove, true);
+  document.addEventListener("keydown", onCancelBuildGreen, true);
+}
+
+function endBuildGreen() {
+  greenBuildMode = false;
+  greenStart = null;
+  clearGreenPreview();
+  if (viewer && viewer.container) viewer.container.style.cursor = "";
+  viewer.container && viewer.container.removeEventListener("click", onBuildGreenClick, true);
+  viewer.container && viewer.container.removeEventListener("mousemove", onBuildGreenMove, true);
+  document.removeEventListener("keydown", onCancelBuildGreen, true);
+}
+
+function onCancelBuildGreen(ev) {
+  if (ev.key !== "Escape") return;
+  endBuildGreen();
+  setStatus("green tool closed", 1500);
+}
+
+function onBuildGreenClick(ev) {
+  ev.stopPropagation(); ev.preventDefault();
+  const pt = surfacePointAt(ev.clientX, ev.clientY);
+  if (!pt) { setStatus("click on a surface", 2500); return; }
+  if (!greenStart) {
+    greenStart = { x: pt.x, y: pt.y, z: pt.z };
+    setStatus("First corner set — click the opposite corner  (Esc to cancel)");
+    return;
+  }
+  const s = greenStart, e = { x: pt.x, y: pt.y, z: pt.z };
+  clearGreenPreview();
+  greenStart = null;
+  const areaSqm = Math.abs((e.x - s.x) * (e.y - s.y));
+  if (areaSqm < 0.25) { setStatus("area too small — click a first corner", 2000); return; }
+  greenSeq += 1;
+  const name = "green_" + String(greenSeq).padStart(2, "0");
+  addGreenOverlay(name, s, e);
+  const areaSqft = areaSqm * 10.763910416709722;
+  postEdit({ op: "add_green", target: name, asset_type: "green",
+             start_utm: worldToUtm(s), end_utm: worldToUtm(e),
+             area_sqft: areaSqft },
+           `placed ${name} (${areaSqm.toFixed(0)} m²)`);
+  setStatus(`placed ${name} — click another first corner  (Esc to finish)`);
+}
+
+function onBuildGreenMove(ev) {
+  if (!greenBuildMode || !greenStart) return;
+  const pt = surfacePointAt(ev.clientX, ev.clientY);
+  if (!pt) return;
+  clearGreenPreview();
+  greenPreview = buildGreenMesh(greenStart, { x: pt.x, y: pt.y, z: pt.z },
+                                { opacity: 0.4, drape: false });
+  viewer.impl.addOverlay("greens", greenPreview);
   viewer.impl.invalidate(true, true, true);
 }
 
@@ -750,7 +1110,7 @@ function resetScene() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ clear: true }),
   }).then(r => r.json()).then(res => {
-    for (const name in removed) viewer.show(removed[name]);
+    for (const name in removed) showFrags(removed[name]);
     removed = {};
     for (const name in placed) {
       const reg = assetByName[name];
@@ -759,6 +1119,7 @@ function resetScene() {
     placed = {};
     history = [];
     clearRoads();
+    clearGreens();
     renderCost(res.estimate);
     setStatus("Scene reset to original state", 2500);
   }).catch(err => { setStatus("reset failed", 3000); console.error(err); });

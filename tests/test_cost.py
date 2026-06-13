@@ -125,6 +125,17 @@ def test_add_road_needs_width_and_length():
         estimate([{"op": "add_road", "target": "road_03", "width_m": 7.0}], CATALOG)
 
 
+def test_move_road_is_free_and_emits_no_line_item():
+    road = {"op": "add_road", "target": "road_01", "width_m": 7.0, "length_m": 30.0}
+    move = {"op": "move_road", "target": "road_01",
+            "from_path_utm": [[0, 0, 0], [30, 0, 0]],
+            "to_path_utm": [[10, 5, -1], [40, 5, -1]], "width_m": 7.0}
+    base = estimate([road], CATALOG).total
+    r = estimate([road, move], CATALOG)        # relocating a road adds nothing
+    assert r.total == pytest.approx(base)
+    assert all(li.op != "move_road" for li in r.line_items)
+
+
 def test_total_is_sum_and_by_op_groups():
     edits = [
         {"op": "repave", "treatment": "crack_seal", "area_sqft": 100},

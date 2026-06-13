@@ -88,6 +88,22 @@ def test_apply_add_road_prices_and_undo_reports_it(tmp_path):
     assert undo["undone"]["target"] == "road_01"
 
 
+def test_apply_move_road_is_free_and_undo_reports_path(tmp_path):
+    _seed(tmp_path)
+    road = {"op": "add_road", "target": "road_01", "asset_type": "road",
+            "path_utm": [[0, 0, 0], [30, 0, 0]], "width_m": 7.0, "length_m": 30.0}
+    after_add = ts.apply_post({"edit": road}, out_dir=str(tmp_path))
+    move = {"op": "move_road", "target": "road_01", "asset_type": "road",
+            "from_path_utm": [[0, 0, 0], [30, 0, 0]],
+            "to_path_utm": [[12, 4, -1], [42, 4, -1]], "width_m": 7.0, "length_m": 30.0}
+    after_move = ts.apply_post({"edit": move}, out_dir=str(tmp_path))
+    assert after_move["estimate"]["total"] == pytest.approx(after_add["estimate"]["total"])
+    # undo restores the road's previous polyline for the viewer to redraw
+    undo = ts.apply_post({"undo": True}, out_dir=str(tmp_path))
+    assert undo["undone"]["op"] == "move_road"
+    assert undo["undone"]["from_path_utm"] == [[0, 0, 0], [30, 0, 0]]
+
+
 def test_bad_post_raises(tmp_path):
     _seed(tmp_path)
     with pytest.raises(ValueError):

@@ -52,3 +52,6 @@ removal:
 
 # New road construction (base course + binder + surface course, per sq ft)
 road_construction_sqft: 15.00
+
+# Green terrain fill (topsoil + sod / seeding + establishment, per sq ft)
+green_fill_sqft: 5.00

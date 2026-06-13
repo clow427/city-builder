@@ -325,6 +325,14 @@ def _price_add_road(edit, catalog, objects) -> list[LineItem]:
     return items
 
 
+def _price_add_green(edit, catalog, objects) -> list[LineItem]:
+    unit_cost = float(catalog.get("green_fill_sqft", 5.00))
+    area = _area_sqft(edit, objects)
+    return [LineItem("add_green", "green terrain fill (topsoil + sod)",
+                     area, "sq ft", unit_cost, area * unit_cost,
+                     target=edit.get("target"))]
+
+
 def _price_remove(edit, catalog, objects) -> list[LineItem]:
     asset_type = _infer_asset_type(edit, objects)
     table = catalog.get("removal", {})
@@ -336,6 +344,11 @@ def _price_remove(edit, catalog, objects) -> list[LineItem]:
                      target=edit.get("target"))]
 
 
+def _price_move_road(edit, catalog, objects) -> list[LineItem]:
+    """Relocating an existing road adds no cost — it's the same pavement, moved."""
+    return []
+
+
 _HANDLERS = {
     "repave": _price_repave,
     "relocate": _price_relocate,
@@ -344,6 +357,8 @@ _HANDLERS = {
     "widen": _price_widen,
     "narrow": _price_widen,
     "add_road": _price_add_road,
+    "move_road": _price_move_road,
+    "add_green": _price_add_green,
     "remove": _price_remove,
 }
 

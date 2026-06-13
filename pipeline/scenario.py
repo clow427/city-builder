@@ -102,3 +102,16 @@ def add_road_edit(target: str, path_utm, width_m: float,
     if length_m is not None:
         edit["length_m"] = float(length_m)
     return edit
+
+
+def move_road_edit(target: str, from_path_utm, to_path_utm, width_m: float,
+                   length_m: float | None = None) -> dict:
+    """Relocate an existing road: its previous and new polylines (metres of run
+    unchanged). Carries no cost — the cost engine prices `move_road` at zero."""
+    edit = {"op": "move_road", "target": target, "asset_type": "road",
+            "from_path_utm": [[float(v) for v in pt] for pt in from_path_utm],
+            "to_path_utm": [[float(v) for v in pt] for pt in to_path_utm],
+            "width_m": float(width_m)}
+    if length_m is not None:
+        edit["length_m"] = float(length_m)
+    return edit
