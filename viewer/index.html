@@ -4,16 +4,26 @@
 <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
 <style>#v{position:absolute;inset:0}</style>
 </head><body>
-<div style="position:absolute;z-index:9;top:8px;left:50%;transform:translateX(-50%)">
+<div style="position:absolute;z-index:9;top:8px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px">
   <select id="scene-select" onchange="onSceneChange(this.value)" style="font:700 12px sans-serif;padding:3px 6px"></select>
 </div>
 <div style="position:absolute;z-index:9;top:8px;left:8px">
-  <button onclick="startRelocate()">Relocate selected</button>
+  <button onclick="startRelocate()">Relocate</button>
+  <button onclick="startBuildRoad()">Build road</button>
+  <label style="background:#fff;padding:2px 5px;font:700 12px sans-serif">w
+    <input id="road-width" type="number" value="7" min="1" max="40" step="0.5" style="width:46px"> m</label>
   <button onclick="undoEdit()">Undo</button>
-  <button onclick="deleteCar()">Hide selected</button>
-  <button onclick="togglePoints()">Toggle point cloud</button>
-  <button onclick="toggleCost()">Cost estimate</button>
+  <button onclick="removeAsset()">Remove asset</button>
+  <button onclick="togglePoints()">Toggle LiDAR</button>
+  <button onclick="toggleCost()">Itemized cost</button>
+  <button onclick="resetScene()" style="background:#c0392b;color:#fff;font-weight:700">Reset scene</button>
   <span id="status" style="background:#DEFF00;padding:3px 7px;font:700 12px sans-serif;display:none"></span>
+</div>
+<div style="position:absolute;z-index:9;top:8px;right:8px;
+  background:#111;border:1px solid #DEFF00;padding:4px 12px;font:700 13px sans-serif;
+  display:flex;align-items:center;gap:8px">
+  <span style="color:#aaa">Budget</span>
+  <span id="budget-total" style="color:#DEFF00">$0.00</span>
 </div>
 <div id="cost" style="position:absolute;z-index:9;bottom:8px;left:8px;display:none;
   background:#111;color:#eee;padding:10px 12px;font:12px/1.45 sans-serif;

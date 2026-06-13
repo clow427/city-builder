@@ -99,6 +99,32 @@ def test_widen_emits_pavement_and_curb_items():
     assert r.total == pytest.approx(120 * 12.0 + 30 * 35.0)
 
 
+def test_add_road_prices_pavement_area_and_two_curbs():
+    # explicit length_m + width_m (what the viewer carries)
+    r = estimate([{"op": "add_road", "target": "road_01",
+                   "width_m": 7.0, "length_m": 30.0}], CATALOG)
+    from pipeline.cost import FT_PER_M, SQFT_PER_SQM
+    area_sqft = 30.0 * 7.0 * SQFT_PER_SQM
+    curb_ft = 30.0 * FT_PER_M * 2.0
+    assert len(r.line_items) == 2
+    assert r.total == pytest.approx(area_sqft * 12.0 + curb_ft * 35.0)
+    assert r.by_op()["add_road"] == pytest.approx(r.total)
+
+
+def test_add_road_derives_length_from_path_when_absent():
+    # no length_m -> horizontal length comes off path_utm (3-4-5 -> 5 m run)
+    r = estimate([{"op": "add_road", "target": "road_02", "width_m": 6.0,
+                   "path_utm": [[0, 0, -1.0], [3, 4, -2.0]]}], CATALOG)
+    from pipeline.cost import FT_PER_M, SQFT_PER_SQM
+    assert r.total == pytest.approx(5.0 * 6.0 * SQFT_PER_SQM * 12.0
+                                    + 5.0 * FT_PER_M * 2.0 * 35.0)
+
+
+def test_add_road_needs_width_and_length():
+    with pytest.raises(CostError):
+        estimate([{"op": "add_road", "target": "road_03", "width_m": 7.0}], CATALOG)
+
+
 def test_total_is_sum_and_by_op_groups():
     edits = [
         {"op": "repave", "treatment": "crack_seal", "area_sqft": 100},

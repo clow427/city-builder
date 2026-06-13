@@ -9,11 +9,22 @@ let assetByName = {};          // name -> {name, type, utm:[x,y,z]} authored pos
 let nameDb = {};               // object name -> viewer dbId
 let placed = {};               // name -> current UTM (after moves)
 let history = [];              // [{name, from}] for undo
+let removed = {};              // name -> dbId for hidden/removed assets
 let relocateMode = false;
 
 // Scene selector
 let scenes = [];
 let currentScene = null;       // {id, label, urn, data_dir}
+
+// Road-building state (Cities:Skylines-style "extend road" tool)
+let roadBuildMode = false;     // armed by the "Build road" button
+let roadStart = null;          // world point of the first click {x,y,z}
+let roads = [];                // [{name, mesh}] live road overlays
+let roadPreview = null;        // rubber-band mesh shown while aiming
+let roadOverlayReady = false;  // is the "roads" overlay scene created
+let roadSeq = 0;               // highest road_NN index seen, for naming
+const ROAD_LIFT = 0.05;        // metres above the sampled surface (anti z-fight)
+const ROAD_COLOR = 0x3b3b3b;   // asphalt grey
 
 Autodesk.Viewing.Initializer({
   env: "AutodeskProduction2", api: "streamingV2",
@@ -45,9 +56,11 @@ function onSceneChange(id) {
 function loadScene(s) {
   currentScene = s;
   selected = null;
-  nameDb = {}; assetByName = {}; placed = {}; history = []; sceneMeta = null;
+  nameDb = {}; assetByName = {}; placed = {}; history = []; removed = {}; sceneMeta = null;
   assetFrags = null;
   endRelocate();
+  endBuildRoad();
+  clearRoads();
 
   if (lidarPoints) {
     if (lidarVisible) viewer.impl.removeOverlay("lidar", lidarPoints);
@@ -93,6 +106,7 @@ function loadScene(s) {
       .then(loadPointCloud)
       .then(setHumanView)
       .then(loadSceneData)
+      .then(loadRoads)
       .then(refreshCost);
   }, err => console.error("load failed", err));
 }
@@ -157,9 +171,38 @@ function togglePoints() {
   viewer.impl.invalidate(true, true, true);
 }
 
-function deleteCar() {
+// Reverse-lookup: dbId -> object name via nameDb.
+function dbIdToName(dbId) {
+  for (const [name, id] of Object.entries(nameDb)) {
+    if (id === dbId) return name;
+  }
+  return null;
+}
+
+// If `name` is a sub-component (e.g. car_01_cabin, tree_01_canopy) find the
+// registered base asset it belongs to (car_01, tree_01).
+function assetNameOf(name) {
+  if (!name) return null;
+  if (assetByName[name]) return name;
+  for (const aname of Object.keys(assetByName)) {
+    if (name.startsWith(aname + "_")) return aname;
+  }
+  return name;
+}
+
+// Hide the selected object and post a remove edit so the cost engine prices it.
+// Cars (LiDAR-detected parked vehicles) have a $0 removal cost per the catalog.
+function removeAsset() {
   if (selected == null) return alert("Select an object first");
+  const rawName = dbIdToName(selected);
   viewer.hide(selected);
+  const name = assetNameOf(rawName) || rawName;
+  if (name) {
+    removed[name] = selected;
+    const reg = assetByName[name];
+    const assetType = reg ? reg.type : name.replace(/_\d+$/, "").toLowerCase();
+    postEdit({ op: "remove", target: name, asset_type: assetType }, `removed ${name}`);
+  }
 }
 
 // --- scene data + status -----------------------------------------------------
@@ -332,7 +375,7 @@ function installDragTool() {
     deactivate: () => { drag = null; },
 
     handleButtonDown: (ev, button) => {
-      if (relocateMode) return false;  // button flow owns clicks while armed
+      if (relocateMode || roadBuildMode) return false;  // other flows own clicks
       if (button !== 0 || ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
       const pick = pickEv(ev);
       const g = pick && ground(ev);
@@ -351,7 +394,7 @@ function installDragTool() {
 
     handleMouseMove: ev => {
       if (!drag) {                      // hover: hint that the asset is grabbable
-        if (!relocateMode && viewer.container.style.cursor !== "grabbing") {
+        if (!relocateMode && !roadBuildMode && viewer.container.style.cursor !== "grabbing") {
           const hit = viewer.impl.hitTest(ev.canvasX, ev.canvasY, false);
           viewer.container.style.cursor = assetNameAt(hit) ? "grab" : "";
         }
@@ -430,14 +473,15 @@ function onRelocateClick(ev) {
   commitMove(pick.name, pick.fragIds, pick.fromUtm, delta);
 }
 
-function postEdit(edit) {
+function postEdit(edit, doneMsg) {
   fetch("/api/scenario?scene=" + encodeURIComponent(currentScene.id), {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ edit }),
   }).then(r => r.json()).then(res => {
     renderCost(res.estimate);
     const w = res.warnings || [];
-    setStatus(w.length ? "⚠ " + w.join("; ") : `moved ${edit.target}`, w.length ? 6000 : 2500);
+    setStatus(w.length ? "⚠ " + w.join("; ") : (doneMsg || `moved ${edit.target}`),
+              w.length ? 6000 : 2500);
   }).catch(err => { setStatus("save failed", 3000); console.error(err); });
 }
 
@@ -447,12 +491,20 @@ function undoEdit() {
     body: JSON.stringify({ undo: true }),
   }).then(r => r.json()).then(res => {
     renderCost(res.estimate);
-    const h = history.pop();
-    if (h && assetByName[h.name]) {
-      const reg = assetByName[h.name];
-      placed[h.name] = h.from;
-      const fragIds = (h.fragIds && h.fragIds.length) ? h.fragIds : fragsForAsset(h.name);
-      moveFrags(fragIds, h.from[0] - reg.utm[0], h.from[1] - reg.utm[1]);
+    const u = res.undone;
+    if (u && u.op === "add_road") {
+      removeRoadByName(u.target);
+    } else if (u && u.op === "remove") {
+      const dbId = removed[u.target];
+      if (dbId != null) { viewer.show(dbId); delete removed[u.target]; }
+    } else {
+      const h = history.pop();
+      if (h && assetByName[h.name]) {
+        const reg = assetByName[h.name];
+        placed[h.name] = h.from;
+        const fragIds = (h.fragIds && h.fragIds.length) ? h.fragIds : fragsForAsset(h.name);
+        moveFrags(fragIds, h.from[0] - reg.utm[0], h.from[1] - reg.utm[1]);
+      }
     }
     setStatus("undid last edit", 2000);
   }).catch(err => { setStatus("undo failed", 3000); console.error(err); });
@@ -472,6 +524,190 @@ window.__sfDebug = function () {
   };
 };
 
+// --- road building: extend roads across the scene, Cities:Skylines-style -----
+// Two clicks place a straight segment. Each endpoint's elevation is sampled from
+// the surface under it (the road it connects to), and the ribbon slopes between
+// the two — so a new road meets each existing road flush. Width is taken from
+// the toolbar field (metres). Segments render as flat overlay ribbons (they are
+// NOT part of the SVF2 model) and persist as `add_road` edits in the scenario,
+// which the cost engine prices (pavement area + curb both sides).
+
+// World <-> UTM (the scenario's canonical frame). XY uses the scene origin and
+// the model's global offset; Z uses the offset only (origin is 2-D).
+function utmToWorld(u) {
+  const o = (sceneMeta && sceneMeta.origin) || [0, 0];
+  const off = (viewer.model.getData().globalOffset) || { x: 0, y: 0, z: 0 };
+  return { x: u[0] - o[0] - off.x, y: u[1] - (o[1] || 0) - off.y, z: (u[2] || 0) - (off.z || 0) };
+}
+function worldToUtm(p) {
+  const o = (sceneMeta && sceneMeta.origin) || [0, 0];
+  const off = (viewer.model.getData().globalOffset) || { x: 0, y: 0, z: 0 };
+  return [p.x + off.x + o[0], p.y + off.y + (o[1] || 0), p.z + (off.z || 0)];
+}
+
+// World-space point on the surface under a client pixel — the real mesh Z if a
+// surface is hit (so endpoints sit at road height), else the ground plane.
+function surfacePointAt(clientX, clientY) {
+  const h = viewer.impl.hitTest(clientX, clientY, false);
+  if (h && (h.intersectPoint || h.point)) return h.intersectPoint || h.point;
+  return viewer.impl.intersectGround(clientX, clientY);
+}
+
+function horizLength(a, b) { return Math.hypot(b.x - a.x, b.y - a.y); }
+
+// A flat road ribbon between two world points, `width` metres wide, lifted a
+// hair above the surface to avoid z-fighting. Endpoints keep their own Z, so the
+// quad slopes from one to the other.
+function buildRoadMesh(s, e, width, opacity) {
+  const dx = e.x - s.x, dy = e.y - s.y;
+  const len = Math.hypot(dx, dy) || 1e-6;
+  const nx = -dy / len, ny = dx / len;         // unit perpendicular in XY
+  const hw = width / 2, px = nx * hw, py = ny * hw;
+  const sz = s.z + ROAD_LIFT, ez = e.z + ROAD_LIFT;
+  const A = [s.x + px, s.y + py, sz], B = [s.x - px, s.y - py, sz];
+  const C = [e.x - px, e.y - py, ez], D = [e.x + px, e.y + py, ez];
+  const pos = new Float32Array([...A, ...B, ...C, ...A, ...C, ...D]);
+  const geom = new THREE.BufferGeometry();
+  geom.addAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+  const mat = new THREE.MeshBasicMaterial({
+    color: ROAD_COLOR, side: THREE.DoubleSide,
+    transparent: opacity != null && opacity < 1, opacity: opacity != null ? opacity : 1,
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
+function ensureRoadOverlay() {
+  if (roadOverlayReady) return;
+  viewer.impl.createOverlayScene("roads");
+  roadOverlayReady = true;
+}
+
+// Place a committed road overlay (no persistence — callers persist separately).
+function addRoadOverlay(name, s, e, width) {
+  ensureRoadOverlay();
+  const mesh = buildRoadMesh(s, e, width, 1);
+  viewer.impl.addOverlay("roads", mesh);
+  roads.push({ name, mesh });
+  viewer.impl.invalidate(true, true, true);
+  return mesh;
+}
+
+function removeRoadByName(name) {
+  const i = roads.findIndex(r => r.name === name);
+  if (i < 0) return;
+  if (roadOverlayReady) viewer.impl.removeOverlay("roads", roads[i].mesh);
+  roads.splice(i, 1);
+  viewer.impl.invalidate(true, true, true);
+}
+
+function clearRoads() {
+  if (roadOverlayReady) {
+    for (const r of roads) viewer.impl.removeOverlay("roads", r.mesh);
+    viewer.impl.removeOverlayScene("roads");
+  }
+  roads = []; roadOverlayReady = false; roadSeq = 0;
+  roadStart = null; roadPreview = null;
+}
+
+function clearRoadPreview() {
+  if (roadPreview && roadOverlayReady) viewer.impl.removeOverlay("roads", roadPreview);
+  roadPreview = null;
+}
+
+function roadWidth() {
+  const el = document.getElementById("road-width");
+  const w = el ? parseFloat(el.value) : 7;
+  return (isFinite(w) && w > 0) ? w : 7;
+}
+
+// Redraw persisted roads for the current scene from its scenario.
+function loadRoads() {
+  return fetch("/api/scenario?scene=" + encodeURIComponent(currentScene.id))
+    .then(r => r.json()).then(res => {
+      const edits = (res.scenario && res.scenario.edits) || [];
+      edits.filter(e => e.op === "add_road" && e.path_utm && e.path_utm.length >= 2)
+        .forEach(e => {
+          const s = utmToWorld(e.path_utm[0]);
+          const en = utmToWorld(e.path_utm[e.path_utm.length - 1]);
+          addRoadOverlay(e.target, s, en, e.width_m || 7);
+          const m = /_(\d+)$/.exec(e.target || "");
+          if (m) roadSeq = Math.max(roadSeq, parseInt(m[1], 10));
+        });
+    }).catch(() => {});
+}
+
+// --- road tool: click start, click end ---------------------------------------
+
+function startBuildRoad() {
+  if (!viewer.model || !sceneMeta) return setStatus("scene still loading…", 2000);
+  endRelocate();
+  roadBuildMode = true;
+  roadStart = null;
+  clearRoadPreview();
+  ensureRoadOverlay();
+  viewer.container.style.cursor = "crosshair";
+  setStatus(`Build road (${roadWidth()} m wide): click the start point  (Esc to finish)`);
+  viewer.container.addEventListener("click", onBuildRoadClick, true);
+  viewer.container.addEventListener("mousemove", onBuildRoadMove, true);
+  document.addEventListener("keydown", onCancelBuildRoad, true);
+}
+
+function endBuildRoad() {
+  roadBuildMode = false;
+  roadStart = null;
+  clearRoadPreview();
+  if (viewer && viewer.container) viewer.container.style.cursor = "";
+  viewer.container && viewer.container.removeEventListener("click", onBuildRoadClick, true);
+  viewer.container && viewer.container.removeEventListener("mousemove", onBuildRoadMove, true);
+  document.removeEventListener("keydown", onCancelBuildRoad, true);
+}
+
+function onCancelBuildRoad(ev) {
+  if (ev.key !== "Escape") return;
+  endBuildRoad();
+  setStatus("road tool closed", 1500);
+}
+
+function onBuildRoadClick(ev) {
+  ev.stopPropagation(); ev.preventDefault();
+  const pt = surfacePointAt(ev.clientX, ev.clientY);
+  if (!pt) { setStatus("click on the ground or a road surface", 2500); return; }
+  if (!roadStart) {                       // first click: anchor the start
+    roadStart = { x: pt.x, y: pt.y, z: pt.z };
+    setStatus(`Start set — click the end point  (${roadWidth()} m wide, Esc to finish)`);
+    return;
+  }
+  const s = roadStart, e = { x: pt.x, y: pt.y, z: pt.z };
+  const width = roadWidth();
+  clearRoadPreview();
+  roadStart = null;                       // ready for the next independent segment
+  if (horizLength(s, e) < 0.5) {          // ignore an accidental double-click
+    setStatus("segment too short — click a start point", 2000);
+    return;
+  }
+  roadSeq += 1;
+  const name = "road_" + String(roadSeq).padStart(2, "0");
+  addRoadOverlay(name, s, e, width);
+  const path_utm = [worldToUtm(s), worldToUtm(e)];
+  postEdit({ op: "add_road", target: name, asset_type: "road",
+             path_utm, width_m: width, length_m: horizLength(s, e) },
+           `built ${name} (${horizLength(s, e).toFixed(1)} m × ${width} m)`);
+  setStatus(`built ${name} — click another start point  (Esc to finish)`);
+}
+
+// Rubber-band preview between the anchored start and the cursor.
+function onBuildRoadMove(ev) {
+  if (!roadBuildMode || !roadStart) return;
+  const pt = surfacePointAt(ev.clientX, ev.clientY);
+  if (!pt) return;
+  clearRoadPreview();
+  roadPreview = buildRoadMesh(roadStart, { x: pt.x, y: pt.y, z: pt.z }, roadWidth(), 0.45);
+  viewer.impl.addOverlay("roads", roadPreview);
+  viewer.impl.invalidate(true, true, true);
+}
+
 // --- live cost panel (running total of the proposal) -------------------------
 
 function toggleCost() {
@@ -487,10 +723,15 @@ function refreshCost() {
 }
 
 function renderCost(rep) {
+  const usd = n => "$" + Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const total = (rep && !rep.error) ? (rep.total || 0) : 0;
+  const budgetEl = document.getElementById("budget-total");
+  if (budgetEl) budgetEl.textContent = usd(total);
+
   const body = document.getElementById("cost-body");
+  if (!body) return;
   if (!rep || rep.error) { body.textContent = (rep && rep.error) || "no estimate"; return; }
-  if (!rep.line_items || !rep.line_items.length) { body.textContent = "No edits yet — relocate an asset to start a proposal."; return; }
-  const usd = n => "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (!rep.line_items || !rep.line_items.length) { body.textContent = "No edits yet."; return; }
   let html = "<table style='border-collapse:collapse;width:100%'>";
   for (const li of rep.line_items) {
     html += `<tr><td style='padding:1px 6px 1px 0'>${li.description}</td>`
@@ -501,3 +742,25 @@ function renderCost(rep) {
   html += "</table>";
   body.innerHTML = html;
 }
+
+// Reset scene: clear all edits on the server, restore all moved/removed objects
+// in the viewer, and zero out the budget display.
+function resetScene() {
+  fetch("/api/scenario?scene=" + encodeURIComponent(currentScene.id), {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clear: true }),
+  }).then(r => r.json()).then(res => {
+    for (const name in removed) viewer.show(removed[name]);
+    removed = {};
+    for (const name in placed) {
+      const reg = assetByName[name];
+      if (reg) moveFrags(fragsForAsset(name), 0, 0);
+    }
+    placed = {};
+    history = [];
+    clearRoads();
+    renderCost(res.estimate);
+    setStatus("Scene reset to original state", 2500);
+  }).catch(err => { setStatus("reset failed", 3000); console.error(err); });
+}
+

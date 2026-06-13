@@ -87,3 +87,18 @@ def relocate_edit(target: str, from_utm, to_utm, asset_type: str | None = None) 
 
 def add_ramp_edit(at_utm) -> dict:
     return {"op": "add_ramp", "at_utm": [float(v) for v in at_utm]}
+
+
+def add_road_edit(target: str, path_utm, width_m: float,
+                  length_m: float | None = None) -> dict:
+    """A new road segment: a polyline of [x, y, z] points and a width (metres).
+
+    `length_m` (horizontal run) is carried so the cost engine stays geometry-free;
+    if omitted the cost engine recomputes it from `path_utm`.
+    """
+    edit = {"op": "add_road", "target": target, "asset_type": "road",
+            "path_utm": [[float(v) for v in pt] for pt in path_utm],
+            "width_m": float(width_m)}
+    if length_m is not None:
+        edit["length_m"] = float(length_m)
+    return edit

@@ -69,8 +69,23 @@ def test_undo_and_clear(tmp_path):
     ts.apply_post({"edit": e}, out_dir=str(tmp_path))
     after_undo = ts.apply_post({"undo": True}, out_dir=str(tmp_path))
     assert len(after_undo["scenario"]["edits"]) == 1
+    assert after_undo["undone"]["op"] == "add_ramp"   # popped edit is reported back
     after_clear = ts.apply_post({"clear": True}, out_dir=str(tmp_path))
     assert after_clear["scenario"]["edits"] == []
+
+
+def test_apply_add_road_prices_and_undo_reports_it(tmp_path):
+    _seed(tmp_path)
+    road = {"op": "add_road", "target": "road_01", "asset_type": "road",
+            "path_utm": [[0, 0, 0], [30, 0, 0]], "width_m": 7.0, "length_m": 30.0}
+    res = ts.apply_post({"edit": road}, out_dir=str(tmp_path))
+    assert len(res["scenario"]["edits"]) == 1
+    assert res["estimate"]["by_op"]["add_road"] > 0
+    assert res["warnings"] == []                       # roads skip the clearance check
+    # the viewer relies on `undone.target` to drop the right road overlay
+    undo = ts.apply_post({"undo": True}, out_dir=str(tmp_path))
+    assert undo["undone"]["op"] == "add_road"
+    assert undo["undone"]["target"] == "road_01"
 
 
 def test_bad_post_raises(tmp_path):

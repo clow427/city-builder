@@ -35,3 +35,20 @@ relocation:
   manhole_cover:        2000.00
   catch_basin:          2500.00
   default:              1500.00
+
+# Per-item removal. car = 0 (detected parked cars are scan markers, not real work items).
+removal:
+  tree:                 1200.00
+  car:                     0.00
+  hydrant:              3000.00
+  utility_pole:         5000.00
+  traffic_signal:       8000.00
+  traffic_signal_pole:  8000.00
+  sign:                  400.00
+  luminaries:           2500.00
+  manhole_cover:        1500.00
+  catch_basin:          1800.00
+  default:               800.00
+
+# New road construction (base course + binder + surface course, per sq ft)
+road_construction_sqft: 15.00

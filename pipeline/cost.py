@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 SQFT_PER_SQM = 10.763910416709722
+FT_PER_M = 3.280839895013123
 
 # repave treatment name -> catalog["pavement"] key
 TREATMENT_KEYS = {
@@ -194,6 +195,13 @@ def _move_distance_m(edit: dict) -> float | None:
     return math.dist(a[:2], b[:2])
 
 
+def _path_length_m(path) -> float | None:
+    """Horizontal (XY) length of a polyline of [x, y, z] points, or None."""
+    if not path or len(path) < 2:
+        return None
+    return sum(math.dist(a[:2], b[:2]) for a, b in zip(path, path[1:]))
+
+
 # ------------------------------------------------------------------- op pricing
 
 def _price_repave(edit, catalog, objects) -> list[LineItem]:
@@ -283,6 +291,51 @@ def _price_widen(edit, catalog, objects) -> list[LineItem]:
     return items
 
 
+def _price_add_road(edit, catalog, objects) -> list[LineItem]:
+    """A newly-built road segment: new pavement (length x width) + curb both sides.
+
+    Width/length come off the edit (the viewer carries them); length falls back
+    to the horizontal length of `path_utm` so the edit stays self-describing.
+    """
+    width_m = float(edit.get("width_m") or 0.0)
+    length_m = edit.get("length_m")
+    if length_m is None:
+        length_m = _path_length_m(edit.get("path_utm"))
+    if not width_m or not length_m:
+        raise CostError("add_road edit needs width_m and length_m (or a path_utm "
+                        f"of >=2 points); got keys {sorted(edit)}")
+    length_m = float(length_m)
+
+    treatment = edit.get("pavement_treatment", "full_depth_recon")
+    key = TREATMENT_KEYS.get(treatment)
+    if key is None:
+        raise CostError(f"unknown pavement_treatment {treatment!r}; "
+                        f"expected one of {sorted(TREATMENT_KEYS)}")
+    pave_unit = float(catalog["pavement"][key])
+    area_sqft = length_m * width_m * SQFT_PER_SQM
+    items = [LineItem("add_road",
+                      f"new road pavement ({treatment.replace('_', ' ')})",
+                      area_sqft, "sq ft", pave_unit, area_sqft * pave_unit,
+                      target=edit.get("target"))]
+
+    curb_ft = length_m * FT_PER_M * 2.0          # a curb line on each side
+    curb_unit = float(catalog["curb_linear_ft"])
+    items.append(LineItem("add_road", "curb (both sides)", curb_ft, "linear ft",
+                          curb_unit, curb_ft * curb_unit, target=edit.get("target")))
+    return items
+
+
+def _price_remove(edit, catalog, objects) -> list[LineItem]:
+    asset_type = _infer_asset_type(edit, objects)
+    table = catalog.get("removal", {})
+    unit_cost = float(table.get(asset_type, table.get("default", 800.0)))
+    if unit_cost == 0:
+        return []
+    desc = f"remove {asset_type.replace('_', ' ')}"
+    return [LineItem("remove", desc, 1, "each", unit_cost, unit_cost,
+                     target=edit.get("target"))]
+
+
 _HANDLERS = {
     "repave": _price_repave,
     "relocate": _price_relocate,
@@ -290,6 +343,8 @@ _HANDLERS = {
     "regrade": _price_regrade,
     "widen": _price_widen,
     "narrow": _price_widen,
+    "add_road": _price_add_road,
+    "remove": _price_remove,
 }
 
 

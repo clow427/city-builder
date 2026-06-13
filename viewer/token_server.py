@@ -118,10 +118,11 @@ def apply_post(body: dict, out_dir=OUT_DIR) -> dict:
     """Apply one scenario mutation and return {scenario, estimate, warnings}."""
     scen = read_scenario(out_dir)
     warnings = []
+    undone = None
     if body.get("clear"):
         scen.clear()
     elif body.get("undo"):
-        scen.undo()
+        undone = scen.undo()
     elif "scenario" in body:
         scen = Scenario.from_dict(body["scenario"])
     elif "edit" in body:
@@ -133,7 +134,7 @@ def apply_post(body: dict, out_dir=OUT_DIR) -> dict:
         raise ValueError("POST body needs one of: edit, undo, clear, scenario")
     scen.save(os.path.join(out_dir, "scenario.json"))
     return {"scenario": scen.to_dict(), "estimate": _estimate_dict(scen),
-            "warnings": warnings}
+            "warnings": warnings, "undone": undone}
 
 
 # ----------------------------------------------------------------- HTTP handler
